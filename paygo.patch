@@ -1,15 +1,125 @@
 diff --git a/include/linux/paygo.h b/include/linux/paygo.h
 new file mode 100644
-index 000000000..cae413b9d
+index 000000000..05c4636e7
 --- /dev/null
 +++ b/include/linux/paygo.h
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,43 @@
 +#ifndef __PAYGO_H__
 +#define __PAYGO_H__
 +
-+#include <linux/module.h>
-+#include <linux/kernel.h>
-+#include <linux/init.h>
++#include <linux/percpu.h>
++#include <linux/list.h>
++#include <linux/hashtable.h>
++#include <linux/spinlock.h>
++#include <linux/percpu.h>
++#include <linux/kthread.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <asm/atomic.h>
++#include <linux/hash.h>
++#include <linux/sched.h>
++
++
++//////////////////////////////////////////////////////////////////////////////////////////
++//pubilc
++int paygo_ref(void *obj);
++int paygo_unref(void *obj);
++bool paygo_query(void *obj);
++void paygo_debug(void);
++
++int paygo_ref(void *obj)
++{
++	return paygo_inc(obj);
++}
++
++int paygo_unref(void *obj)
++{
++	return paygo_dec(obj);
++}
++
++bool paygo_query(void *obj)
++{
++	return paygo_read(obj);
++}
++
++void paygo_debug(void)
++{
++	traverse_paygo();
++}
++#endif // __PAYGO_H__
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f75..03b6ada97 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -734,6 +734,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct anchor_info {
++	int cpu;
++	void *obj;
++	struct list_head list;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -749,6 +755,8 @@ struct task_struct {
+ 	unsigned int			saved_state;
+ #endif
+ 
++	struct list_head anchor_info_list;
++
+ 	/*
+ 	 * This begins the randomizable portion of task_struct. Only
+ 	 * scheduling-critical items should be added above here.
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bf..0eb4ea518 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -71,6 +71,7 @@ struct task_struct init_task
+ 	.thread_info	= INIT_THREAD_INFO(init_task),
+ 	.stack_refcount	= REFCOUNT_INIT(1),
+ #endif
++	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
+ 	.__state	= 0,
+ 	.stack		= init_stack,
+ 	.usage		= REFCOUNT_INIT(2),
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f7fe3541..8b555b78b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
+ 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
+ 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
+ 	p->flags |= PF_FORKNOEXEC;
++	
++	INIT_LIST_HEAD(&p->anchor_info_list);
++
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
+ 	rcu_copy_process(p);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 0e20a8d6d..afc009abc 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -44,6 +44,7 @@
+ #include <linux/migrate.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlbflush.h>
++#include <linux/paygo.h>
+ #include "internal.h"
+ 
+ #define CREATE_TRACE_POINTS
+diff --git a/mm/paygo.h b/mm/paygo.h
+new file mode 100644
+index 000000000..c67dce902
+--- /dev/null
++++ b/mm/paygo.h
+@@ -0,0 +1,485 @@
++#ifndef __PAYGO_H__
++#define __PAYGO_H__
++
 +#include <linux/percpu.h>
 +#include <linux/list.h>
 +#include <linux/hashtable.h>
@@ -492,67 +602,3 @@ index 000000000..cae413b9d
 +	}
 +}
 +#endif // __PAYGO_H__
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 853d08f75..03b6ada97 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -734,6 +734,12 @@ struct kmap_ctrl {
- #endif
- };
- 
-+struct anchor_info {
-+	int cpu;
-+	void *obj;
-+	struct list_head list;
-+};
-+
- struct task_struct {
- #ifdef CONFIG_THREAD_INFO_IN_TASK
- 	/*
-@@ -749,6 +755,8 @@ struct task_struct {
- 	unsigned int			saved_state;
- #endif
- 
-+	struct list_head anchor_info_list;
-+
- 	/*
- 	 * This begins the randomizable portion of task_struct. Only
- 	 * scheduling-critical items should be added above here.
-diff --git a/init/init_task.c b/init/init_task.c
-index ff6c4b9bf..0eb4ea518 100644
---- a/init/init_task.c
-+++ b/init/init_task.c
-@@ -71,6 +71,7 @@ struct task_struct init_task
- 	.thread_info	= INIT_THREAD_INFO(init_task),
- 	.stack_refcount	= REFCOUNT_INIT(1),
- #endif
-+	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
- 	.__state	= 0,
- 	.stack		= init_stack,
- 	.usage		= REFCOUNT_INIT(2),
-diff --git a/kernel/fork.c b/kernel/fork.c
-index 9f7fe3541..8b555b78b 100644
---- a/kernel/fork.c
-+++ b/kernel/fork.c
-@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
- 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
- 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
- 	p->flags |= PF_FORKNOEXEC;
-+	
-+	INIT_LIST_HEAD(&p->anchor_info_list);
-+
- 	INIT_LIST_HEAD(&p->children);
- 	INIT_LIST_HEAD(&p->sibling);
- 	rcu_copy_process(p);
-diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..afc009abc 100644
---- a/mm/filemap.c
-+++ b/mm/filemap.c
-@@ -44,6 +44,7 @@
- #include <linux/migrate.h>
- #include <asm/pgalloc.h>
- #include <asm/tlbflush.h>
-+#include <linux/paygo.h>
- #include "internal.h"
- 
- #define CREATE_TRACE_POINTS
