@@ -1,61 +1,12 @@
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 853d08f75..03b6ada97 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -734,6 +734,12 @@ struct kmap_ctrl {
- #endif
- };
- 
-+struct anchor_info {
-+	int cpu;
-+	void *obj;
-+	struct list_head list;
-+};
-+
- struct task_struct {
- #ifdef CONFIG_THREAD_INFO_IN_TASK
- 	/*
-@@ -749,6 +755,8 @@ struct task_struct {
- 	unsigned int			saved_state;
- #endif
- 
-+	struct list_head anchor_info_list;
-+
- 	/*
- 	 * This begins the randomizable portion of task_struct. Only
- 	 * scheduling-critical items should be added above here.
-diff --git a/init/init_task.c b/init/init_task.c
-index ff6c4b9bf..0eb4ea518 100644
---- a/init/init_task.c
-+++ b/init/init_task.c
-@@ -71,6 +71,7 @@ struct task_struct init_task
- 	.thread_info	= INIT_THREAD_INFO(init_task),
- 	.stack_refcount	= REFCOUNT_INIT(1),
- #endif
-+	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
- 	.__state	= 0,
- 	.stack		= init_stack,
- 	.usage		= REFCOUNT_INIT(2),
-diff --git a/kernel/fork.c b/kernel/fork.c
-index 9f7fe3541..8b555b78b 100644
---- a/kernel/fork.c
-+++ b/kernel/fork.c
-@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
- 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
- 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
- 	p->flags |= PF_FORKNOEXEC;
-+	
-+	INIT_LIST_HEAD(&p->anchor_info_list);
-+
- 	INIT_LIST_HEAD(&p->children);
- 	INIT_LIST_HEAD(&p->sibling);
- 	rcu_copy_process(p);
-diff --git a/mm/paygo.c b/mm/paygo.c
+diff --git a/include/linux/paygo.h b/include/linux/paygo.h
 new file mode 100644
-index 000000000..ef285d361
+index 000000000..1a20c07c9
 --- /dev/null
-+++ b/mm/paygo.c
-@@ -0,0 +1,585 @@
++++ b/include/linux/paygo.h
+@@ -0,0 +1,500 @@
++#ifndef __PAYGO_H__
++#define __PAYGO_H__
++
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/init.h>
@@ -71,8 +22,6 @@ index 000000000..ef285d361
 +#include <linux/hash.h>
 +#include <linux/sched.h>
 +
-+#include "paygo.h"
-+
 +
 +//////////////////////////////////////////////////////////////////////////////////////////
 +// custom number
@@ -84,7 +33,21 @@ index 000000000..ef285d361
 +#define HASHSHIFT (11)
 +
 +//////////////////////////////////////////////////////////////////////////////////////////
++//pubilc
++int paygo_inc(void *obj);
++int paygo_dec(void *obj);
++bool paygo_read(void *obj);
++void traverse_paygo(void);
 +
++//private
++static unsigned long hash_function(const void *obj);
++static int push_hash(void *obj);
++static struct paygo_entry *find_hash(void *obj);
++static void record_anchor(int cpu, void *obj);
++static int unrecord_anchor(void *obj);
++static void dec_other_entry(void *obj, int cpu);
++
++//////////////////////////////////////////////////////////////////////////////////////////
 +//data structures
 +struct paygo_entry {
 +	void *obj;
@@ -114,102 +77,6 @@ index 000000000..ef285d361
 +};
 +
 +DEFINE_PER_CPU(struct paygo *, paygo_table_ptr);
-+//////////////////////////////////////////////////////////////////////////////////////////
-+// private functions
-+
-+/*
-+-------------------------------------------------------
-+These functions are used for setting up.
-+
-+1. hash_function
-+-------------------------------------------------------
-+These functions are used in hashtable.
-+
-+2. push_hash 
-+3. find_hash
-+-------------------------------------------------------
-+These functions are used for anchor information to put and get.
-+
-+4. record_anchor
-+5. unrecord_anchor
-+-------------------------------------------------------
-+This function is used in paygo_dec when decrement other cpu's hashtable entry.
-+
-+6. dec_other_entry
-+
-+*/
-+
-+/**
-+ * hash_function
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * Return: index of the object in the PCP-hashtable
-+ */
-+static unsigned long hash_function(const void *obj);
-+
-+/**
-+ * push_hash
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * Return: 0 for success
-+ *
-+ * Push paygo entry into the per-cpu hashtable.
-+ *
-+ */
-+static int push_hash(void *obj);
-+
-+/**
-+ * find_hash
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * Return: pointer of the paygo entry from the per-cpu hashtable.
-+ *
-+ * Find paygo entry from the per-cpu hashtable.
-+ * And delete entry of the hash table when if the hash table's entry's total count is zero.
-+ */
-+static struct paygo_entry *find_hash(void *obj);
-+
-+/**
-+ * record_anchor
-+ *
-+ * @cpu: id of the processor
-+ * @thread_id: id of the task (Not a pid. this is the logical number of the thread)
-+ *
-+ * Context: used in paygo_inc
-+ *
-+ * Record the CPU ID of the processor on which PAYGO_REF was executed to the tast struct. 
-+ *
-+ */
-+static void record_anchor(int thread_id, int cpu, void *obj);
-+
-+/**
-+ * unrecord_anchor
-+ *
-+ * @thread_id: id of the task (Not a pid. this is the logical number of the thread)
-+ *
-+ * Context: used in paygo_dec
-+ *
-+ * Get the CPU ID of the processor on which PAYGO_REF was *LAST* executed.
-+ *
-+ */
-+static int unrecord_anchor(int thread_id, void *obj);
-+
-+/**
-+ * dec_other_entry
-+ *
-+ * @obj: pointer of the object
-+ * @cpu: id of the processor
-+ *
-+ *
-+ * Decrement the given cpu's anchor counter.
-+ *
-+ */
-+static void dec_other_entry(void *obj, int cpu);
-+
-+//////////////////////////////////////////////////////////////////////////////////////////
 +
 +static void __init init_paygo_table(void)
 +{
@@ -366,7 +233,7 @@ index 000000000..ef285d361
 +	return NULL;
 +}
 +
-+int paygo_inc(void *obj, int thread_id)
++int paygo_inc(void *obj)
 +{
 +	int ret;
 +	int cpu;
@@ -380,7 +247,7 @@ index 000000000..ef285d361
 +	if (entry) {
 +		entry->local_counter += 1;
 +		entry->x += 1;
-+		record_anchor(thread_id, cpu, obj);
++		record_anchor(cpu, obj);
 +		ret = 0;
 +		put_cpu();
 +		return ret;
@@ -388,20 +255,19 @@ index 000000000..ef285d361
 +
 +	// if there isn't
 +	ret = push_hash(obj);
-+	record_anchor(thread_id, cpu, obj);
++	record_anchor(cpu, obj);
 +	put_cpu();
 +	return ret;
 +}
-+EXPORT_SYMBOL(paygo_inc);
 +
-+int paygo_dec(void *obj, int thread_id)
++int paygo_dec(void *obj)
 +{
 +	int cpu;
 +	int anchor_cpu;
 +	struct paygo_entry *entry;
 +	cpu = get_cpu();
 +
-+	anchor_cpu = unrecord_anchor(thread_id, obj);
++	anchor_cpu = unrecord_anchor(obj);
 +
 +	// local operation
 +	if (likely(cpu == anchor_cpu)) {
@@ -425,7 +291,6 @@ index 000000000..ef285d361
 +	put_cpu();
 +	return 0;
 +}
-+EXPORT_SYMBOL(paygo_dec);
 +
 +bool paygo_read(void *obj)
 +{
@@ -505,9 +370,8 @@ index 000000000..ef285d361
 +	put_cpu();
 +	return true;
 +}
-+EXPORT_SYMBOL(paygo_read);
 +
-+static void record_anchor(int thread_id, int cpu, void *obj)
++static void record_anchor(int cpu, void *obj)
 +{
 +	struct anchor_info *info;
 +	info = kmalloc(sizeof(struct anchor_info), GFP_KERNEL);
@@ -520,7 +384,7 @@ index 000000000..ef285d361
 +	list_add_tail(&info->list, &current->anchor_info_list);
 +}
 +
-+static int unrecord_anchor(int thread_id, void *obj)
++static int unrecord_anchor(void *obj)
 +{
 +	struct anchor_info *info;
 +	int cpu = -1;
@@ -639,77 +503,56 @@ index 000000000..ef285d361
 +		pr_info("THREAD%d did %d jobs\n", i, thread_ops[i]);
 +	}
 +}
-+EXPORT_SYMBOL(traverse_paygo);
-+
-diff --git a/mm/paygo.h b/mm/paygo.h
-new file mode 100644
-index 000000000..31b73b78f
---- /dev/null
-+++ b/mm/paygo.h
-@@ -0,0 +1,66 @@
-+#ifndef __PAYGO_H__
-+#define __PAYGO_H__
-+
-+/* Functions
-+
-+-------------------------------------------------------
-+These functions are APIs for reference counting.
-+
-+0. init_paygo
-+
-+1. paygo_ref
-+2. paygo_unref 
-+
-+3. paygo_read (not yet)
-+-------------------------------------------------------
-+*/
-+
-+/**
-+ * paygo_ref
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * @thread_id: this is thread id used only in tests instead of task struct
-+ *
-+ * Return: 0 for success
-+ *
-+ * increment reference count of the object.
-+ *
-+ */
-+int paygo_inc(void *obj, int thread_id);
-+
-+/**
-+ * paygo_unref
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * @thread_id: this is thread id used only in tests instead of task struct
-+ *
-+ * Return: 0 for success
-+ *
-+ * decrement reference count of the object.
-+ *
-+ */
-+int paygo_dec(void *obj, int thread_id);
-+
-+/**
-+ * paygo_read
-+ *
-+ * @obj: pointer of the object
-+ *
-+ * Return: True when the total count is zero, False when else
-+ *
-+ */
-+bool paygo_read(void *obj);
-+
-+/**
-+ * traverse_paygo
-+ *
-+ * Context: This function must run alone. 
-+ *
-+ * Traverse hashtables and print about all of the per-cpu hashtable's entries.
-+ *
-+ */
-+void traverse_paygo(void);
-+
 +#endif // __PAYGO_H__
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f75..03b6ada97 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -734,6 +734,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct anchor_info {
++	int cpu;
++	void *obj;
++	struct list_head list;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -749,6 +755,8 @@ struct task_struct {
+ 	unsigned int			saved_state;
+ #endif
+ 
++	struct list_head anchor_info_list;
++
+ 	/*
+ 	 * This begins the randomizable portion of task_struct. Only
+ 	 * scheduling-critical items should be added above here.
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bf..0eb4ea518 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -71,6 +71,7 @@ struct task_struct init_task
+ 	.thread_info	= INIT_THREAD_INFO(init_task),
+ 	.stack_refcount	= REFCOUNT_INIT(1),
+ #endif
++	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
+ 	.__state	= 0,
+ 	.stack		= init_stack,
+ 	.usage		= REFCOUNT_INIT(2),
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f7fe3541..8b555b78b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
+ 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
+ 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
+ 	p->flags |= PF_FORKNOEXEC;
++	
++	INIT_LIST_HEAD(&p->anchor_info_list);
++
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
+ 	rcu_copy_process(p);
