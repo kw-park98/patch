@@ -1,0 +1,715 @@
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f75..03b6ada97 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -734,6 +734,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct anchor_info {
++	int cpu;
++	void *obj;
++	struct list_head list;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -749,6 +755,8 @@ struct task_struct {
+ 	unsigned int			saved_state;
+ #endif
+ 
++	struct list_head anchor_info_list;
++
+ 	/*
+ 	 * This begins the randomizable portion of task_struct. Only
+ 	 * scheduling-critical items should be added above here.
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bf..0eb4ea518 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -71,6 +71,7 @@ struct task_struct init_task
+ 	.thread_info	= INIT_THREAD_INFO(init_task),
+ 	.stack_refcount	= REFCOUNT_INIT(1),
+ #endif
++	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
+ 	.__state	= 0,
+ 	.stack		= init_stack,
+ 	.usage		= REFCOUNT_INIT(2),
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f7fe3541..8b555b78b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
+ 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
+ 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
+ 	p->flags |= PF_FORKNOEXEC;
++	
++	INIT_LIST_HEAD(&p->anchor_info_list);
++
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
+ 	rcu_copy_process(p);
+diff --git a/mm/paygo.c b/mm/paygo.c
+new file mode 100644
+index 000000000..ef285d361
+--- /dev/null
++++ b/mm/paygo.c
+@@ -0,0 +1,585 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/percpu.h>
++#include <linux/list.h>
++#include <linux/hashtable.h>
++#include <linux/spinlock.h>
++#include <linux/percpu.h>
++#include <linux/kthread.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <asm/atomic.h>
++#include <linux/hash.h>
++#include <linux/sched.h>
++
++#include "paygo.h"
++
++
++//////////////////////////////////////////////////////////////////////////////////////////
++// custom number
++
++// size of the per-cpu hashtable
++#define TABLESIZE (16)
++
++// hash function shift bits
++#define HASHSHIFT (11)
++
++//////////////////////////////////////////////////////////////////////////////////////////
++
++//data structures
++struct paygo_entry {
++	void *obj;
++	int local_counter;
++	atomic_t anchor_counter;
++	struct list_head list;
++
++
++	// x,y are used for debug
++	// x means local inc to the obj
++	// y means local dec to the obj
++
++	// (x + y) = entry->local_counter (always)
++	// (x + y) + anchor_counter = 0 when the program end (i.e. After all inc and dec pairs have been terminated)
++	int x;
++	int y;
++} ____cacheline_aligned_in_smp;
++
++struct overflow {
++	spinlock_t lock;
++	struct list_head head;
++};
++
++struct paygo {
++	struct paygo_entry entries[TABLESIZE];
++	struct overflow overflow_lists[TABLESIZE];
++};
++
++DEFINE_PER_CPU(struct paygo *, paygo_table_ptr);
++//////////////////////////////////////////////////////////////////////////////////////////
++// private functions
++
++/*
++-------------------------------------------------------
++These functions are used for setting up.
++
++1. hash_function
++-------------------------------------------------------
++These functions are used in hashtable.
++
++2. push_hash 
++3. find_hash
++-------------------------------------------------------
++These functions are used for anchor information to put and get.
++
++4. record_anchor
++5. unrecord_anchor
++-------------------------------------------------------
++This function is used in paygo_dec when decrement other cpu's hashtable entry.
++
++6. dec_other_entry
++
++*/
++
++/**
++ * hash_function
++ *
++ * @obj: pointer of the object
++ *
++ * Return: index of the object in the PCP-hashtable
++ */
++static unsigned long hash_function(const void *obj);
++
++/**
++ * push_hash
++ *
++ * @obj: pointer of the object
++ *
++ * Return: 0 for success
++ *
++ * Push paygo entry into the per-cpu hashtable.
++ *
++ */
++static int push_hash(void *obj);
++
++/**
++ * find_hash
++ *
++ * @obj: pointer of the object
++ *
++ * Return: pointer of the paygo entry from the per-cpu hashtable.
++ *
++ * Find paygo entry from the per-cpu hashtable.
++ * And delete entry of the hash table when if the hash table's entry's total count is zero.
++ */
++static struct paygo_entry *find_hash(void *obj);
++
++/**
++ * record_anchor
++ *
++ * @cpu: id of the processor
++ * @thread_id: id of the task (Not a pid. this is the logical number of the thread)
++ *
++ * Context: used in paygo_inc
++ *
++ * Record the CPU ID of the processor on which PAYGO_REF was executed to the tast struct. 
++ *
++ */
++static void record_anchor(int thread_id, int cpu, void *obj);
++
++/**
++ * unrecord_anchor
++ *
++ * @thread_id: id of the task (Not a pid. this is the logical number of the thread)
++ *
++ * Context: used in paygo_dec
++ *
++ * Get the CPU ID of the processor on which PAYGO_REF was *LAST* executed.
++ *
++ */
++static int unrecord_anchor(int thread_id, void *obj);
++
++/**
++ * dec_other_entry
++ *
++ * @obj: pointer of the object
++ * @cpu: id of the processor
++ *
++ *
++ * Decrement the given cpu's anchor counter.
++ *
++ */
++static void dec_other_entry(void *obj, int cpu);
++
++//////////////////////////////////////////////////////////////////////////////////////////
++
++static void __init init_paygo_table(void)
++{
++	int cpu;
++	struct paygo *p;
++
++	// initialize all of cpu's hashtable
++	for_each_possible_cpu(cpu) {
++		p = kzalloc(sizeof(struct paygo), GFP_KERNEL);
++		if (!p) {
++			pr_err("Failed to allocate paygo table for CPU %d\n",
++			       cpu);
++			continue;
++		}
++
++		per_cpu(paygo_table_ptr, cpu) = p;
++
++		for (int j = 0; j < TABLESIZE; j++) {
++			p->entries[j].obj = NULL;
++			p->entries[j].local_counter = 0;
++			atomic_set(&p->entries[j].anchor_counter, 0);
++			spin_lock_init(&p->overflow_lists[j].lock);
++			INIT_LIST_HEAD(&p->overflow_lists[j].head);
++		}
++	}
++}
++module_init(init_paygo_table);
++
++static unsigned long hash_function(const void *obj)
++{
++	unsigned long ret;
++	unsigned long hash;
++	hash = hash_64((unsigned long)obj, HASHSHIFT);
++	ret = hash % TABLESIZE;
++	return ret;
++}
++
++static int push_hash(void *obj)
++{
++	unsigned long hash;
++	struct paygo_entry *entry;
++	struct overflow *ovfl;
++	struct paygo *p = per_cpu(paygo_table_ptr, smp_processor_id());
++
++	hash = hash_function(obj);
++	entry = &p->entries[hash];
++
++	// when the hashtable's entry is NULL
++	if (entry->obj == NULL) {
++		{
++			entry->obj = obj;
++			entry->local_counter = 1;
++			atomic_set(&entry->anchor_counter, 0);
++
++			entry->x = 1;
++			entry->y = 0;
++		}
++		return 0;
++	}
++
++	// when there is NULL in the entry
++	// We need to insert a new entry into the overflow list
++	else {
++		struct paygo_entry *new_entry;
++		ovfl = &p->overflow_lists[hash];
++		new_entry = kzalloc(sizeof(struct paygo_entry), GFP_ATOMIC);
++		if (!new_entry) {
++			return -ENOMEM;
++		}
++		{
++			new_entry->obj = obj;
++			new_entry->local_counter = 1;
++			atomic_set(&new_entry->anchor_counter, 0);
++
++			new_entry->x = 1;
++			new_entry->y = 0;
++		}
++
++		spin_lock(&ovfl->lock);
++		list_add(&new_entry->list, &ovfl->head);
++		spin_unlock(&ovfl->lock);
++		return 0;
++	}
++}
++
++static struct paygo_entry *find_hash(void *obj)
++{
++	int cpu;
++	unsigned long hash;
++	struct paygo_entry *entry;
++	struct overflow *ovfl;
++	struct list_head *pos, *n;
++	struct paygo *p;
++	cpu = smp_processor_id();
++	p = per_cpu(paygo_table_ptr, cpu);
++
++	hash = hash_function(obj);
++
++	entry = &p->entries[hash];
++
++// redo to delete a new entry when the sum of the new entry's counter taken from the overflow list is 0
++redo:
++	if (likely(entry->obj == obj)) {
++		return entry;
++	} else {
++		ovfl = &p->overflow_lists[hash];
++		spin_lock(&ovfl->lock);
++		///////////////////////////////////////////////////////////////////////////////////////////
++		// delete entry on hash table
++		if (unlikely(entry->local_counter +
++				     atomic_read(&(entry->anchor_counter)) ==
++			     0)) {
++			struct paygo_entry *new_entry;
++			if (!list_empty(&ovfl->head)) {
++				new_entry = list_first_entry(
++					&ovfl->head, struct paygo_entry, list);
++				*entry = *new_entry;
++				list_del(&new_entry->list);
++				kfree(new_entry);
++				spin_unlock(&ovfl->lock);
++				// we need to redo and check
++				// 0. Whether or not a new entry in the hashtable is what we were looking for
++				// 1. Whether or not the overflow list is empty
++				goto redo;
++			}
++
++			else {
++				entry->obj = NULL;
++				entry->local_counter = 0;
++				atomic_set(&(entry->anchor_counter), 0);
++				entry->x = 0;
++				entry->y = 0;
++
++				spin_unlock(&ovfl->lock);
++				return NULL;
++			}
++		}
++		///////////////////////////////////////////////////////////////////////////////////////////
++
++		// the hashtable's entry is not the entry that we are looking for.
++		// so we need to search overflow list
++		list_for_each_safe(pos, n, &ovfl->head) {
++			struct paygo_entry *ovfl_entry =
++				list_entry(pos, struct paygo_entry, list);
++
++			if (ovfl_entry->obj == obj) {
++				spin_unlock(&ovfl->lock);
++				return ovfl_entry;
++			}
++		}
++		spin_unlock(&ovfl->lock);
++	}
++
++	return NULL;
++}
++
++int paygo_inc(void *obj, int thread_id)
++{
++	int ret;
++	int cpu;
++	struct paygo_entry *entry;
++	cpu = get_cpu();
++
++	cpu_ops_ref[cpu] += 1;
++
++	entry = find_hash(obj);
++	// if there is an entry!
++	if (entry) {
++		entry->local_counter += 1;
++		entry->x += 1;
++		record_anchor(thread_id, cpu, obj);
++		ret = 0;
++		put_cpu();
++		return ret;
++	}
++
++	// if there isn't
++	ret = push_hash(obj);
++	record_anchor(thread_id, cpu, obj);
++	put_cpu();
++	return ret;
++}
++EXPORT_SYMBOL(paygo_inc);
++
++int paygo_dec(void *obj, int thread_id)
++{
++	int cpu;
++	int anchor_cpu;
++	struct paygo_entry *entry;
++	cpu = get_cpu();
++
++	anchor_cpu = unrecord_anchor(thread_id, obj);
++
++	// local operation
++	if (likely(cpu == anchor_cpu)) {
++		cpu_ops_unref_local[cpu] += 1;
++		entry = find_hash(obj);
++		// All unref operations are called after the ref operation is called.
++		// Therefore, there should never be a situation where there is no entry when doing an unref.
++		if (!entry) {
++			pr_info("paygo_dec: NULL return ERR!!!\n");
++			put_cpu();
++			return 0;
++		}
++		entry->local_counter -= 1;
++		entry->y -= 1;
++	}
++	// global operation
++	else {
++		cpu_ops_unref_other[cpu] += 1;
++		dec_other_entry(obj, anchor_cpu);
++	}
++	put_cpu();
++	return 0;
++}
++EXPORT_SYMBOL(paygo_dec);
++
++bool paygo_read(void *obj)
++{
++	int mycpu;
++	int cur_cpu;
++	unsigned long hash;
++	struct paygo *p;
++	struct overflow *ovfl;
++	struct list_head *pos, *n;
++	struct paygo_entry *entry;
++
++	mycpu = get_cpu();
++	hash = hash_function(obj);
++
++	for_each_possible_cpu(cur_cpu) {
++		p = per_cpu(paygo_table_ptr, cur_cpu);
++		// self-checking
++		if (unlikely(mycpu == cur_cpu)) {
++			entry = find_hash(obj);
++			if (entry) {
++				// There can be a dec_other operation.
++				// Therefore, we need to check total count at this time.
++				if (entry->local_counter +
++					    atomic_read(
++						    &(entry->anchor_counter)) >
++				    0) {
++					put_cpu();
++					return false;
++				}
++			}
++			continue;
++		}
++		// check other cpu
++		else {
++			// Unlike dec_other, in paygo_read there is no 100% certainty
++			// that there is an entry in the hashtable (or in the overflow list).
++			// Therefore, we must first prevent the hashtable's owner from removing a entry from the overflow list
++			// and adding it to the hashtable. (this step is done in find_hash)
++			ovfl = &p->overflow_lists[hash];
++			spin_lock(&ovfl->lock);
++
++			entry = &p->entries[hash];
++			if (entry->obj == obj) {
++				if (entry->local_counter +
++					    atomic_read(
++						    &(entry->anchor_counter)) >
++				    0) {
++					spin_unlock(&ovfl->lock);
++					put_cpu();
++					return false;
++				}
++			} else {
++				list_for_each_safe(pos, n, &ovfl->head) {
++					struct paygo_entry *ovfl_entry =
++						list_entry(pos,
++							   struct paygo_entry,
++							   list);
++					if (ovfl_entry->obj == obj) {
++						if (ovfl_entry->local_counter +
++							    atomic_read(&(
++								    ovfl_entry
++									    ->anchor_counter)) >
++						    0) {
++							spin_unlock(
++								&ovfl->lock);
++							put_cpu();
++							return false;
++						}
++					}
++				}
++			}
++			spin_unlock(&ovfl->lock);
++			continue;
++		}
++	}
++
++	put_cpu();
++	return true;
++}
++EXPORT_SYMBOL(paygo_read);
++
++static void record_anchor(int thread_id, int cpu, void *obj)
++{
++	struct anchor_info *info;
++	info = kmalloc(sizeof(struct anchor_info), GFP_KERNEL);
++	if (!info) {
++		pr_err("Failed to allocate memory for anchor_info\n");
++		return;
++	}
++	info->cpu = cpu;
++	info->obj = obj;
++	list_add_tail(&info->list, &current->anchor_info_list);
++}
++
++static int unrecord_anchor(int thread_id, void *obj)
++{
++	struct anchor_info *info;
++	int cpu = -1;
++
++	list_for_each_entry_reverse(
++		info, &current->anchor_info_list, list) {
++		if (info->obj == obj) {
++			cpu = info->cpu;
++			list_del(&info->list);
++			kfree(info);
++			break;
++		}
++	}
++
++	// Since all of the unref operations are always followed by ref operations,
++	// there is no situation where anchor information list is empty.
++	if (cpu == -1) {
++		pr_err("Failed to find anchor_info with given obj\n");
++	}
++
++	return cpu;
++}
++
++static void dec_other_entry(void *obj, int cpu)
++{
++	unsigned long hash;
++	struct overflow *ovfl;
++	struct list_head *pos, *n;
++	struct paygo *p;
++
++	hash = hash_function(obj);
++	p = per_cpu(paygo_table_ptr, cpu);
++
++// If the entry we are looking for does not exist in the overflow list, we should try again
++// because the owner of the hash table may have moved the entry from that overflow list to the hashtable.
++retry:
++	if (p->entries[hash].obj == obj) {
++		atomic_dec(&p->entries[hash].anchor_counter);
++	} else {
++		ovfl = &p->overflow_lists[hash];
++		spin_lock(&ovfl->lock);
++		list_for_each_safe(pos, n, &ovfl->head) {
++			struct paygo_entry *ovfl_entry =
++				list_entry(pos, struct paygo_entry, list);
++			if (likely(ovfl_entry->obj == obj)) {
++				atomic_dec(&ovfl_entry->anchor_counter);
++				spin_unlock(&ovfl->lock);
++				return;
++			}
++		}
++		spin_unlock(&ovfl->lock);
++		goto retry;
++	}
++}
++
++void traverse_paygo(void)
++{
++	struct paygo *p;
++	struct paygo_entry *entry;
++	struct list_head *cur;
++	int i;
++	int cpu;
++	int ovfl_length;
++
++	entry = NULL;
++
++	for_each_possible_cpu(cpu) {
++		p = per_cpu(paygo_table_ptr, cpu);
++		printk(KERN_INFO "CPU %d:\n", cpu);
++
++		for (i = 0; i < TABLESIZE; i++) {
++			ovfl_length = 1;
++			entry = &p->entries[i];
++			if (entry->obj) {
++				printk(KERN_INFO
++				       "  Entry %d: obj=%p, local_counter=%d, anchor_counter=%d total_count=%d (x=%d y=%d)\n",
++				       i, entry->obj, entry->local_counter,
++				       atomic_read(&entry->anchor_counter),
++				       entry->local_counter +
++					       atomic_read(
++						       &entry->anchor_counter),
++				       entry->x, entry->y);
++			} else {
++				printk(KERN_INFO
++				       "  Entry %d: obj=%p, local_counter=%d, anchor_counter=%d total_count=%d (x=%d y=%d)\n",
++				       i, entry->obj, entry->local_counter,
++				       atomic_read(&entry->anchor_counter),
++				       entry->local_counter +
++					       atomic_read(
++						       &entry->anchor_counter),
++				       entry->x, entry->y);
++			}
++			list_for_each(cur, &p->overflow_lists[i].head) {
++				entry = list_entry(cur, struct paygo_entry,
++						   list);
++				printk(KERN_INFO
++				       "  \tOverflow Entry %d-%d: obj=%p, local_counter=%d, anchor_counter=%d total_count=%d (x=%d y=%d)\n",
++				       i, ovfl_length, entry->obj,
++				       entry->local_counter,
++				       atomic_read(&entry->anchor_counter),
++				       entry->local_counter +
++					       atomic_read(
++						       &entry->anchor_counter),
++				       entry->x, entry->y);
++				ovfl_length++;
++			}
++		}
++	}
++	pr_info("NOBJS: %d\n", NOBJS);
++	for_each_possible_cpu(cpu) {
++		pr_info("CPU[%d]: ref(%d) unref_local(%d) unref_other(%d)\n",
++			cpu, cpu_ops_ref[cpu], cpu_ops_unref_local[cpu],
++			cpu_ops_unref_other[cpu]);
++	}
++	for (i = 0; i < NTHREAD; ++i) {
++		pr_info("THREAD%d did %d jobs\n", i, thread_ops[i]);
++	}
++}
++EXPORT_SYMBOL(traverse_paygo);
++
+diff --git a/mm/paygo.h b/mm/paygo.h
+new file mode 100644
+index 000000000..31b73b78f
+--- /dev/null
++++ b/mm/paygo.h
+@@ -0,0 +1,66 @@
++#ifndef __PAYGO_H__
++#define __PAYGO_H__
++
++/* Functions
++
++-------------------------------------------------------
++These functions are APIs for reference counting.
++
++0. init_paygo
++
++1. paygo_ref
++2. paygo_unref 
++
++3. paygo_read (not yet)
++-------------------------------------------------------
++*/
++
++/**
++ * paygo_ref
++ *
++ * @obj: pointer of the object
++ *
++ * @thread_id: this is thread id used only in tests instead of task struct
++ *
++ * Return: 0 for success
++ *
++ * increment reference count of the object.
++ *
++ */
++int paygo_inc(void *obj, int thread_id);
++
++/**
++ * paygo_unref
++ *
++ * @obj: pointer of the object
++ *
++ * @thread_id: this is thread id used only in tests instead of task struct
++ *
++ * Return: 0 for success
++ *
++ * decrement reference count of the object.
++ *
++ */
++int paygo_dec(void *obj, int thread_id);
++
++/**
++ * paygo_read
++ *
++ * @obj: pointer of the object
++ *
++ * Return: True when the total count is zero, False when else
++ *
++ */
++bool paygo_read(void *obj);
++
++/**
++ * traverse_paygo
++ *
++ * Context: This function must run alone. 
++ *
++ * Traverse hashtables and print about all of the per-cpu hashtable's entries.
++ *
++ */
++void traverse_paygo(void);
++
++#endif // __PAYGO_H__
