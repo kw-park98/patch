@@ -1,9 +1,9 @@
 diff --git a/include/linux/paygo.h b/include/linux/paygo.h
 new file mode 100644
-index 000000000..1a20c07c9
+index 000000000..cae413b9d
 --- /dev/null
 +++ b/include/linux/paygo.h
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,488 @@
 +#ifndef __PAYGO_H__
 +#define __PAYGO_H__
 +
@@ -240,7 +240,6 @@ index 000000000..1a20c07c9
 +	struct paygo_entry *entry;
 +	cpu = get_cpu();
 +
-+	cpu_ops_ref[cpu] += 1;
 +
 +	entry = find_hash(obj);
 +	// if there is an entry!
@@ -271,7 +270,6 @@ index 000000000..1a20c07c9
 +
 +	// local operation
 +	if (likely(cpu == anchor_cpu)) {
-+		cpu_ops_unref_local[cpu] += 1;
 +		entry = find_hash(obj);
 +		// All unref operations are called after the ref operation is called.
 +		// Therefore, there should never be a situation where there is no entry when doing an unref.
@@ -285,7 +283,6 @@ index 000000000..1a20c07c9
 +	}
 +	// global operation
 +	else {
-+		cpu_ops_unref_other[cpu] += 1;
 +		dec_other_entry(obj, anchor_cpu);
 +	}
 +	put_cpu();
@@ -493,15 +490,6 @@ index 000000000..1a20c07c9
 +			}
 +		}
 +	}
-+	pr_info("NOBJS: %d\n", NOBJS);
-+	for_each_possible_cpu(cpu) {
-+		pr_info("CPU[%d]: ref(%d) unref_local(%d) unref_other(%d)\n",
-+			cpu, cpu_ops_ref[cpu], cpu_ops_unref_local[cpu],
-+			cpu_ops_unref_other[cpu]);
-+	}
-+	for (i = 0; i < NTHREAD; ++i) {
-+		pr_info("THREAD%d did %d jobs\n", i, thread_ops[i]);
-+	}
 +}
 +#endif // __PAYGO_H__
 diff --git a/include/linux/sched.h b/include/linux/sched.h
@@ -556,3 +544,15 @@ index 9f7fe3541..8b555b78b 100644
  	INIT_LIST_HEAD(&p->children);
  	INIT_LIST_HEAD(&p->sibling);
  	rcu_copy_process(p);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 0e20a8d6d..afc009abc 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -44,6 +44,7 @@
+ #include <linux/migrate.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlbflush.h>
++#include <linux/paygo.h>
+ #include "internal.h"
+ 
+ #define CREATE_TRACE_POINTS
