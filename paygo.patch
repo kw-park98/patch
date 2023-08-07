@@ -130,10 +130,10 @@ index 0e20a8d6d..2aa878516 100644
  #include <linux/dax.h>
 diff --git a/mm/paygo.c b/mm/paygo.c
 new file mode 100644
-index 000000000..051f1ea65
+index 000000000..c8eec9490
 --- /dev/null
 +++ b/mm/paygo.c
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,436 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Paygo reference counting
@@ -376,6 +376,7 @@ index 000000000..051f1ea65
 +		}
 +	}
 +}
++EXPORT_SYMBOL(init_paygo_table);
 +
 +int paygo_inc(void *obj)
 +{
@@ -401,6 +402,7 @@ index 000000000..051f1ea65
 +	put_cpu();
 +	return ret;
 +}
++EXPORT_SYMBOL(paygo_inc);
 +
 +int paygo_dec(void *obj)
 +{
@@ -431,6 +433,7 @@ index 000000000..051f1ea65
 +	put_cpu();
 +	return 0;
 +}
++EXPORT_SYMBOL(paygo_dec);
 +
 +bool paygo_read(void *obj)
 +{
@@ -510,6 +513,7 @@ index 000000000..051f1ea65
 +	put_cpu();
 +	return true;
 +}
++EXPORT_SYMBOL(paygo_read);
 +
 +void traverse_paygo(void)
 +{
@@ -565,3 +569,4 @@ index 000000000..051f1ea65
 +		}
 +	}
 +}
++EXPORT_SYMBOL(traverse_paygo);
