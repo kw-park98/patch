@@ -117,7 +117,7 @@ index 8e105e5b3..d4bcd270f 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..2aa878516 100644
+index 0e20a8d6d..c829185b3 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,7 @@
@@ -128,6 +128,14 @@ index 0e20a8d6d..2aa878516 100644
  #include <linux/export.h>
  #include <linux/compiler.h>
  #include <linux/dax.h>
+@@ -1039,6 +1040,7 @@ void __init pagecache_init(void)
+ 		init_waitqueue_head(&folio_wait_table[i]);
+ 
+ 	page_writeback_init();
++	init_paygo_table();
+ }
+ 
+ /*
 diff --git a/mm/paygo.c b/mm/paygo.c
 new file mode 100644
 index 000000000..c8eec9490
