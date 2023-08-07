@@ -1,39 +1,22 @@
 diff --git a/include/linux/paygo.h b/include/linux/paygo.h
 new file mode 100644
-index 000000000..e9c0e52d0
+index 000000000..3f1491b4b
 --- /dev/null
 +++ b/include/linux/paygo.h
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,48 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_PAYGO_H
 +#define _LINUX_PAYGO_H
 +
-+#include <linux/percpu.h>
++
 +#include <linux/list.h>
-+#include <linux/hashtable.h>
 +#include <linux/spinlock.h>
-+#include <linux/percpu.h>
-+#include <linux/kthread.h>
-+#include <linux/slab.h>
 +#include <asm/atomic.h>
-+#include <linux/hash.h>
-+#include <linux/sched.h>
 +
 +
-+//////////////////////////////////////////////////////////////////////////////////////////
-+// custom number
-+
-+// size of the per-cpu hashtable
 +#define TABLESIZE (4)
-+
-+// hash function shift bits
 +#define HASHSHIFT (11)
 +
-+
-+//////////////////////////////////////////////////////////////////////////////////////////
-+
-+//////////////////////////////////////////////////////////////////////////////////////////
-+//data structures
 +struct paygo_entry {
 +	void *obj;
 +	int local_counter;
@@ -61,8 +44,6 @@ index 000000000..e9c0e52d0
 +	struct overflow overflow_lists[TABLESIZE];
 +};
 +
-+DEFINE_PER_CPU(struct paygo *, paygo_table_ptr);
-+//////////////////////////////////////////////////////////////////////////////////////////
 +void init_paygo_table(void);
 +int paygo_inc(void *obj);
 +int paygo_dec(void *obj);
@@ -70,13 +51,108 @@ index 000000000..e9c0e52d0
 +void traverse_paygo(void);
 +
 +
-+static unsigned long hash_function(const void *obj);
-+static int push_hash(void *obj);
-+static struct paygo_entry *find_hash(void *obj);
-+static void record_anchor(int cpu, void *obj);
-+static int unrecord_anchor(void *obj);
-+static void dec_other_entry(void *obj, int cpu);
++#endif /* _LINUX_PAYGO_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f75..03b6ada97 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -734,6 +734,12 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct anchor_info {
++	int cpu;
++	void *obj;
++	struct list_head list;
++};
 +
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -749,6 +755,8 @@ struct task_struct {
+ 	unsigned int			saved_state;
+ #endif
+ 
++	struct list_head anchor_info_list;
++
+ 	/*
+ 	 * This begins the randomizable portion of task_struct. Only
+ 	 * scheduling-critical items should be added above here.
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bf..0eb4ea518 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -71,6 +71,7 @@ struct task_struct init_task
+ 	.thread_info	= INIT_THREAD_INFO(init_task),
+ 	.stack_refcount	= REFCOUNT_INIT(1),
+ #endif
++	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
+ 	.__state	= 0,
+ 	.stack		= init_stack,
+ 	.usage		= REFCOUNT_INIT(2),
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f7fe3541..8b555b78b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
+ 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
+ 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
+ 	p->flags |= PF_FORKNOEXEC;
++	
++	INIT_LIST_HEAD(&p->anchor_info_list);
++
+ 	INIT_LIST_HEAD(&p->children);
+ 	INIT_LIST_HEAD(&p->sibling);
+ 	rcu_copy_process(p);
+diff --git a/mm/Makefile b/mm/Makefile
+index 8e105e5b3..d4bcd270f 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -66,6 +66,7 @@ memory-hotplug-$(CONFIG_MEMORY_HOTPLUG) += memory_hotplug.o
+ obj-y += page-alloc.o
+ obj-y += init-mm.o
+ obj-y += memblock.o
++obj-y += paygo.o
+ obj-y += $(memory-hotplug-y)
+ 
+ ifdef CONFIG_MMU
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 0e20a8d6d..2aa878516 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -10,6 +10,7 @@
+  * most "normal" filesystems (but you don't /have/ to use this:
+  * the NFS filesystem used to do this differently, for example)
+  */
++#include <linux/paygo.h>
+ #include <linux/export.h>
+ #include <linux/compiler.h>
+ #include <linux/dax.h>
+diff --git a/mm/paygo.c b/mm/paygo.c
+new file mode 100644
+index 000000000..051f1ea65
+--- /dev/null
++++ b/mm/paygo.c
+@@ -0,0 +1,431 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Paygo reference counting
++ *
++ * Copyright (C) 2023 Hanyang, Univ. Kun-wook Park
++ */
++
++#include <linux/paygo.h>
++#include <linux/percpu.h>
++#include <linux/list.h>
++#include <linux/hashtable.h>
++#include <linux/spinlock.h>
++#include <linux/percpu.h>
++#include <linux/slab.h>
++#include <asm/atomic.h>
++#include <linux/hash.h>
++#include <linux/sched.h>
++
++static DEFINE_PER_CPU(struct paygo *, paygo_table_ptr);
 +
 +static unsigned long hash_function(const void *obj)
 +{
@@ -275,81 +351,6 @@ index 000000000..e9c0e52d0
 +	}
 +}
 +
-+
-+#endif /* _LINUX_PAYGO_H */
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 853d08f75..03b6ada97 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -734,6 +734,12 @@ struct kmap_ctrl {
- #endif
- };
- 
-+struct anchor_info {
-+	int cpu;
-+	void *obj;
-+	struct list_head list;
-+};
-+
- struct task_struct {
- #ifdef CONFIG_THREAD_INFO_IN_TASK
- 	/*
-@@ -749,6 +755,8 @@ struct task_struct {
- 	unsigned int			saved_state;
- #endif
- 
-+	struct list_head anchor_info_list;
-+
- 	/*
- 	 * This begins the randomizable portion of task_struct. Only
- 	 * scheduling-critical items should be added above here.
-diff --git a/init/init_task.c b/init/init_task.c
-index ff6c4b9bf..0eb4ea518 100644
---- a/init/init_task.c
-+++ b/init/init_task.c
-@@ -71,6 +71,7 @@ struct task_struct init_task
- 	.thread_info	= INIT_THREAD_INFO(init_task),
- 	.stack_refcount	= REFCOUNT_INIT(1),
- #endif
-+	.anchor_info_list = LIST_HEAD_INIT(init_task.anchor_info_list),
- 	.__state	= 0,
- 	.stack		= init_stack,
- 	.usage		= REFCOUNT_INIT(2),
-diff --git a/kernel/fork.c b/kernel/fork.c
-index 9f7fe3541..8b555b78b 100644
---- a/kernel/fork.c
-+++ b/kernel/fork.c
-@@ -2147,6 +2147,9 @@ static __latent_entropy struct task_struct *copy_process(
- 	delayacct_tsk_init(p);	/* Must remain after dup_task_struct() */
- 	p->flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY);
- 	p->flags |= PF_FORKNOEXEC;
-+	
-+	INIT_LIST_HEAD(&p->anchor_info_list);
-+
- 	INIT_LIST_HEAD(&p->children);
- 	INIT_LIST_HEAD(&p->sibling);
- 	rcu_copy_process(p);
-diff --git a/mm/paygo.c b/mm/paygo.c
-new file mode 100644
-index 000000000..24941e29e
---- /dev/null
-+++ b/mm/paygo.c
-@@ -0,0 +1,237 @@
-+// SPDX-License-Identifier: GPL-2.0
-+/*
-+ * Paygo reference counting
-+ *
-+ * Copyright (C) 2023 Hanyang, Univ. Kun-wook Park
-+ */
-+
-+#include <linux/paygo.h>
-+#include <linux/atomic.h>
-+#include <linux/kernel.h>
-+#include <linux/percpu.h>
-+#include <linux/list.h>
-+#include <linux/sched.h>
-+#include <linux/bug.h>
-+
 +void init_paygo_table(void)
 +{
 +	int cpu;
@@ -376,16 +377,12 @@ index 000000000..24941e29e
 +	}
 +}
 +
-+
-+
 +int paygo_inc(void *obj)
 +{
 +	int ret;
 +	int cpu;
 +	struct paygo_entry *entry;
 +	cpu = get_cpu();
-+
-+	cpu_ops_ref[cpu] += 1;
 +
 +	entry = find_hash(obj);
 +	// if there is an entry!
@@ -405,7 +402,6 @@ index 000000000..24941e29e
 +	return ret;
 +}
 +
-+
 +int paygo_dec(void *obj)
 +{
 +	int cpu;
@@ -417,7 +413,6 @@ index 000000000..24941e29e
 +
 +	// local operation
 +	if (likely(cpu == anchor_cpu)) {
-+		cpu_ops_unref_local[cpu] += 1;
 +		entry = find_hash(obj);
 +		// All unref operations are called after the ref operation is called.
 +		// Therefore, there should never be a situation where there is no entry when doing an unref.
@@ -431,13 +426,11 @@ index 000000000..24941e29e
 +	}
 +	// global operation
 +	else {
-+		cpu_ops_unref_other[cpu] += 1;
 +		dec_other_entry(obj, anchor_cpu);
 +	}
 +	put_cpu();
 +	return 0;
 +}
-+
 +
 +bool paygo_read(void *obj)
 +{
