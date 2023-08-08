@@ -136,7 +136,7 @@ index 8e105e5b3..132145282 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..00840d7e4 100644
+index 0e20a8d6d..78a8e1bea 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,8 @@
@@ -148,6 +148,16 @@ index 0e20a8d6d..00840d7e4 100644
  #include <linux/export.h>
  #include <linux/compiler.h>
  #include <linux/dax.h>
+@@ -860,8 +862,8 @@ noinline int __filemap_add_folio(struct address_space *mapping,
+ 	}
+ 
+ 	gfp &= GFP_RECLAIM_MASK;
+-	folio_ref_add(folio, nr);
+ 	folio->mapping = mapping;
++	folio_ref_add(folio, nr);
+ 	folio->index = xas.xa_index;
+ 
+ 	do {
 @@ -1039,6 +1041,7 @@ void __init pagecache_init(void)
  		init_waitqueue_head(&folio_wait_table[i]);
  
@@ -156,19 +166,31 @@ index 0e20a8d6d..00840d7e4 100644
  }
  
  /*
-@@ -2384,9 +2387,10 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2386,7 +2389,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
  			break;
- 		if (xa_is_sibling(folio))
- 			break;
--		if (!folio_try_get_rcu(folio))
--			goto retry;
+ 		if (!folio_try_get_rcu(folio))
+ 			goto retry;
 -
-+//		if (!folio_try_get_rcu(folio))
-+//			goto retry;
-+		if(!my_folio_get(folio, mapping))
-+			goto retry;	
++//		if(!my_folio_get(folio, mapping))
++//			goto retry;	
  		if (unlikely(folio != xas_reload(&xas)))
  			goto put_folio;
+ 
+@@ -2400,6 +2404,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
+ 		continue;
+ put_folio:
+ 		folio_put(folio);
++//		my_folio_put(folio);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -2757,6 +2762,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+ put_folios:
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++)
+ 			folio_put(fbatch.folios[i]);
++			//my_folio_put(fbatch.folios[i]);
+ 		folio_batch_init(&fbatch);
+ 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
  
 diff --git a/mm/myref.c b/mm/myref.c
 new file mode 100644
