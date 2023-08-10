@@ -1,6 +1,6 @@
 diff --git a/include/linux/myref.h b/include/linux/myref.h
 new file mode 100644
-index 000000000..331d4e34a
+index 000000000..b58467d64
 --- /dev/null
 +++ b/include/linux/myref.h
 @@ -0,0 +1,12 @@
@@ -11,7 +11,7 @@ index 000000000..331d4e34a
 +#include <linux/fs.h>
 +#include <linux/mm_types.h>
 +
-+int my_folio_get(struct folio *folio, struct address_space *mapping);
++int my_folio_get(struct folio *folio);
 +int my_folio_put(struct folio *folio);
 +bool my_folio_can_freeze(struct folio *folio, int count);
 +
@@ -136,7 +136,7 @@ index 8e105e5b3..132145282 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..b5d75dcfe 100644
+index 0e20a8d6d..a1b63bb4c 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,8 @@
@@ -148,17 +148,39 @@ index 0e20a8d6d..b5d75dcfe 100644
  #include <linux/export.h>
  #include <linux/compiler.h>
  #include <linux/dax.h>
-@@ -860,8 +862,8 @@ noinline int __filemap_add_folio(struct address_space *mapping,
+@@ -840,6 +842,7 @@ EXPORT_SYMBOL_GPL(replace_page_cache_folio);
+ noinline int __filemap_add_folio(struct address_space *mapping,
+ 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
+ {
++	int i;
+ 	XA_STATE(xas, &mapping->i_pages, index);
+ 	int huge = folio_test_hugetlb(folio);
+ 	bool charged = false;
+@@ -860,7 +863,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
  	}
  
  	gfp &= GFP_RECLAIM_MASK;
 -	folio_ref_add(folio, nr);
++	//folio_ref_add(folio, nr);
++	for(i = 0; i < nr; i++) {
++		my_folio_get(folio);
++	}
  	folio->mapping = mapping;
-+	folio_ref_add(folio, nr);
  	folio->index = xas.xa_index;
  
- 	do {
-@@ -1039,6 +1041,7 @@ void __init pagecache_init(void)
+@@ -920,7 +926,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
+ 		mem_cgroup_uncharge(folio);
+ 	folio->mapping = NULL;
+ 	/* Leave page->index set: truncation relies upon it */
+-	folio_put_refs(folio, nr);
++//	folio_put_refs(folio, nr);
++	for(i = 0; i < nr; i++) {
++		my_folio_put(folio);
++	}
+ 	return xas_error(&xas);
+ }
+ ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
+@@ -1039,6 +1048,7 @@ void __init pagecache_init(void)
  		init_waitqueue_head(&folio_wait_table[i]);
  
  	page_writeback_init();
@@ -166,18 +188,24 @@ index 0e20a8d6d..b5d75dcfe 100644
  }
  
  /*
-@@ -2015,7 +2018,9 @@ static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
+@@ -2015,11 +2025,14 @@ static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
  	if (!folio || xa_is_value(folio))
  		return folio;
  
 -	if (!folio_try_get_rcu(folio))
 +//	if (!folio_try_get_rcu(folio))
 +//		goto reset;
-+	if (!my_folio_get(folio, folio->mapping))
++	if (!my_folio_get(folio))
  		goto reset;
  
  	if (unlikely(folio != xas_reload(xas))) {
-@@ -2123,7 +2128,8 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
+-		folio_put(folio);
++//		folio_put(folio);
++		my_folio_put(folio);
+ 		goto reset;
+ 	}
+ 
+@@ -2123,7 +2136,8 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
  unlock:
  		folio_unlock(folio);
  put:
@@ -187,7 +215,7 @@ index 0e20a8d6d..b5d75dcfe 100644
  	}
  	rcu_read_unlock();
  
-@@ -2384,9 +2390,10 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2384,9 +2398,10 @@ static void filemap_get_read_batch(struct address_space *mapping,
  			break;
  		if (xa_is_sibling(folio))
  			break;
@@ -196,12 +224,12 @@ index 0e20a8d6d..b5d75dcfe 100644
 -
 +//		if (!folio_try_get_rcu(folio))
 +//			goto retry;
-+		if(!my_folio_get(folio, mapping))
++		if(!my_folio_get(folio))
 +			goto retry;	
  		if (unlikely(folio != xas_reload(&xas)))
  			goto put_folio;
  
-@@ -2399,7 +2406,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2399,7 +2414,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
  		xas_advance(&xas, folio->index + folio_nr_pages(folio) - 1);
  		continue;
  put_folio:
@@ -211,7 +239,7 @@ index 0e20a8d6d..b5d75dcfe 100644
  retry:
  		xas_reset(&xas);
  	}
-@@ -2757,6 +2765,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2757,6 +2773,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  put_folios:
  		for (i = 0; i < folio_batch_count(&fbatch); i++)
  			folio_put(fbatch.folios[i]);
@@ -221,7 +249,7 @@ index 0e20a8d6d..b5d75dcfe 100644
  
 diff --git a/mm/myref.c b/mm/myref.c
 new file mode 100644
-index 000000000..a4a7e2d45
+index 000000000..3f8c774a3
 --- /dev/null
 +++ b/mm/myref.c
 @@ -0,0 +1,47 @@
@@ -237,12 +265,12 @@ index 000000000..a4a7e2d45
 +#include <linux/mm_types.h>
 +#include <linux/page_ref.h>
 +
-+int my_folio_get(struct folio *folio, struct address_space *mapping)
++int my_folio_get(struct folio *folio)
 +{
 +	int refcount;
 +	paygo_inc((void*)&folio->page);	
 +	refcount = folio_ref_count(folio);	
-+	if(refcount && folio->mapping == mapping) {
++	if(refcount) {
 +		return true;
 +	}
 +	paygo_dec((void*)&folio->page);	
