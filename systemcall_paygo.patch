@@ -12,6 +12,25 @@ index c84d12608..d0115728d 100644
 +550 common	paygo_traverse sys_paygo_traverse
  # This is the end of the legacy x32 range.  Numbers 548 and above are
  # not special and are not to be used for x32-specific syscalls.
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+index e619c31b6..8ad1c6af9 100644
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -35,8 +35,12 @@ static void drop_pagecache_sb(struct super_block *sb, void *unused)
+ 		__iget(inode);
+ 		spin_unlock(&inode->i_lock);
+ 		spin_unlock(&sb->s_inode_list_lock);
+-
+-		invalidate_mapping_pages(inode->i_mapping, 0, -1);
++		if(atomic_read(&inode->paygo)) {
++			pr_info("inum:%lu paygo drop cache!\n", inode->i_ino);
++			invalidate_mapping_pages(inode->i_mapping, 0, -1);
++		} else {
++			invalidate_mapping_pages(inode->i_mapping, 0, -1);
++		}
+ 		iput(toput_inode);
+ 		toput_inode = inode;
+ 
 diff --git a/fs/file_table.c b/fs/file_table.c
 index dd88701e5..cb817cad5 100644
 --- a/fs/file_table.c
@@ -230,6 +249,30 @@ index 000000000..b58467d64
 +bool my_folio_can_freeze(struct folio *folio, int count);
 +
 +#endif /* _LINUX_MYREF_H */
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 29e1f9e76..dd58a6671 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1168,6 +1168,7 @@ struct readahead_control {
+ 	unsigned int _batch_count;
+ 	bool _workingset;
+ 	unsigned long _pflags;
++	atomic_t paygo;
+ };
+ 
+ #define DEFINE_READAHEAD(ractl, f, r, m, i)				\
+@@ -1207,6 +1208,11 @@ void page_cache_sync_readahead(struct address_space *mapping,
+ 		unsigned long req_count)
+ {
+ 	DEFINE_READAHEAD(ractl, file, ra, mapping, index);
++	if(atomic_read(&mapping->host->paygo)) {
++		atomic_set(&ractl.paygo, 4491);
++	} else {
++		atomic_set(&ractl.paygo, 0);
++	}
+ 	page_cache_sync_ra(&ractl, req_count);
+ }
+ 
 diff --git a/include/linux/paygo.h b/include/linux/paygo.h
 new file mode 100644
 index 000000000..3f1491b4b
@@ -390,7 +433,7 @@ index 8e105e5b3..132145282 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..d59354644 100644
+index 0e20a8d6d..e238f0f69 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,8 @@
@@ -449,7 +492,19 @@ index 0e20a8d6d..d59354644 100644
  retry:
  		xas_reset(&xas);
  	}
-@@ -2580,6 +2593,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
+@@ -2570,6 +2583,11 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
+ 		pgoff_t last_index)
+ {
+ 	DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, folio->index);
++	if(atomic_read(&mapping->host->paygo)) {
++		atomic_set(&ractl.paygo, 4491);
++	} else {
++		atomic_set(&ractl.paygo, 0);
++	}
+ 
+ 	if (iocb->ki_flags & IOCB_NOIO)
+ 		return -EAGAIN;
+@@ -2580,6 +2598,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
  static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  		struct folio_batch *fbatch)
  {
@@ -457,7 +512,7 @@ index 0e20a8d6d..d59354644 100644
  	struct file *filp = iocb->ki_filp;
  	struct address_space *mapping = filp->f_mapping;
  	struct file_ra_state *ra = &filp->f_ra;
-@@ -2587,6 +2601,7 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2587,21 +2606,39 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  	pgoff_t last_index;
  	struct folio *folio;
  	int err = 0;
@@ -465,27 +520,20 @@ index 0e20a8d6d..d59354644 100644
  
  	/* "last_index" is the index of the page beyond the end of the read */
  	last_index = DIV_ROUND_UP(iocb->ki_pos + iter->count, PAGE_SIZE);
-@@ -2594,13 +2609,34 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+ retry:
  	if (fatal_signal_pending(current))
  		return -EINTR;
- 
--	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
-+	if(paygo) {
-+		pr_info("\ncheck1 point start");
-+		traverse_paygo();
-+		pr_info("fbatch->nr = %d\n", (int)fbatch->nr);
-+		pr_info("\ncheck1 point end\n\n");	
-+	}
-+
 +	filemap_get_read_batch(mapping, index, last_index - 1, fbatch, paygo);
 +
-+	if(paygo) {
-+		pr_info("\ncheck2 point start");
-+		traverse_paygo();
-+		pr_info("fbatch->nr = %d\n", (int)fbatch->nr);
-+		pr_info("\ncheck2 point end\n\n");	
-+	}
-+
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-1-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
+ 
+-	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
  	if (!folio_batch_count(fbatch)) {
  		if (iocb->ki_flags & IOCB_NOIO)
  			return -EAGAIN;
@@ -493,16 +541,20 @@ index 0e20a8d6d..d59354644 100644
  				last_index - index);
 -		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 +		filemap_get_read_batch(mapping, index, last_index - 1, fbatch, paygo);
-+		if(paygo) {
-+			pr_info("\ncheck3 point start");
-+			traverse_paygo();
-+			pr_info("fbatch->nr = %d\n", (int)fbatch->nr);
-+			pr_info("\ncheck3 point end\n\n");	
-+		}
  	}
++
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-2-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
++
  	if (!folio_batch_count(fbatch)) {
  		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
-@@ -2611,7 +2647,6 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+ 			return -EAGAIN;
+@@ -2611,10 +2648,12 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  			goto retry;
  		return err;
  	}
@@ -510,19 +562,43 @@ index 0e20a8d6d..d59354644 100644
  	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
  	if (folio_test_readahead(folio)) {
  		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
-@@ -2629,8 +2664,21 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
++		if(paygo)
++			pr_info("filemap_readahead err = %d\n", err);		
++
+ 		if (err)
+ 			goto err;
+ 	}
+@@ -2623,16 +2662,48 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+ 		    folio_batch_count(fbatch) > 1)
+ 			iocb->ki_flags |= IOCB_NOWAIT;
+ 		err = filemap_update_page(iocb, mapping, iter, folio);
++		if(paygo)
++			pr_info("filemap_update_page err = %d\n", err);		
++
+ 		if (err)
+ 			goto err;
+ 	}
  
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-3-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
++
  	return 0;
  err:
 -	if (err < 0)
 -		folio_put(folio);
-+	if(paygo) {
-+		pr_info("\n\n");
-+		traverse_paygo();
-+		pr_info("fbatch->nr = %u\n", fbatch->nr);
-+		pr_info("err = %d\n", err);
-+		pr_info("AOP_TRUNCATED_PAGE = %d\n", AOP_TRUNCATED_PAGE);
-+	}
+-	if (likely(--fbatch->nr))
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-err1-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
 +	if(paygo)
 +		my_folio_put(folio);
 +	if (err < 0) {
@@ -530,11 +606,21 @@ index 0e20a8d6d..d59354644 100644
 +			folio_put(folio);
 +		}
 +	}	
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-err2-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
 +
- 	if (likely(--fbatch->nr))
++	if (likely(--fbatch->nr)) {
  		return 0;
++	}
  	if (err == AOP_TRUNCATED_PAGE)
-@@ -2661,6 +2709,7 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
+ 		goto retry;
+ 	return err;
+@@ -2661,6 +2732,7 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
  ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  		ssize_t already_read)
  {
@@ -542,7 +628,7 @@ index 0e20a8d6d..d59354644 100644
  	struct file *filp = iocb->ki_filp;
  	struct file_ra_state *ra = &filp->f_ra;
  	struct address_space *mapping = filp->f_mapping;
-@@ -2669,7 +2718,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2669,7 +2741,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  	int i, error = 0;
  	bool writably_mapped;
  	loff_t isize, end_offset;
@@ -551,16 +637,19 @@ index 0e20a8d6d..d59354644 100644
  	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
  		return 0;
  	if (unlikely(!iov_iter_count(iter)))
-@@ -2691,7 +2740,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2691,8 +2763,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  
  		if (unlikely(iocb->ki_pos >= i_size_read(inode)))
  			break;
 -
 +		
  		error = filemap_get_pages(iocb, iter, &fbatch);
++
++
  		if (error < 0)
  			break;
-@@ -2755,8 +2804,13 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+ 
+@@ -2755,8 +2829,13 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  			}
  		}
  put_folios:
@@ -631,10 +720,10 @@ index 000000000..3f8c774a3
 +EXPORT_SYMBOL(my_folio_can_freeze);
 diff --git a/mm/paygo.c b/mm/paygo.c
 new file mode 100644
-index 000000000..c8eec9490
+index 000000000..8b937b1a6
 --- /dev/null
 +++ b/mm/paygo.c
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,437 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Paygo reference counting
@@ -929,6 +1018,7 @@ index 000000000..c8eec9490
 +	}
 +	// global operation
 +	else {
++		pr_info("migration!!\n");
 +		dec_other_entry(obj, anchor_cpu);
 +	}
 +	put_cpu();
