@@ -433,7 +433,7 @@ index 8e105e5b3..132145282 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..e238f0f69 100644
+index 0e20a8d6d..01c88a57d 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,8 @@
@@ -453,7 +453,22 @@ index 0e20a8d6d..e238f0f69 100644
  }
  
  /*
-@@ -2371,7 +2374,7 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
+@@ -1274,8 +1277,12 @@ static inline int folio_wait_bit_common(struct folio *folio, int bit_nr,
+ 	 *
+ 	 * We can drop our reference to the folio.
+ 	 */
+-	if (behavior == DROP)
+-		folio_put(folio);
++	if (behavior == DROP) {
++		if(atomic_read(&folio->mapping->host->paygo))
++			my_folio_put(folio);
++		else
++			folio_put(folio);
++	}
+ 
+ 	/*
+ 	 * Note that until the "finish_wait()", or until
+@@ -2371,7 +2378,7 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
   * clear so that the caller can take the appropriate action.
   */
  static void filemap_get_read_batch(struct address_space *mapping,
@@ -462,7 +477,7 @@ index 0e20a8d6d..e238f0f69 100644
  {
  	XA_STATE(xas, &mapping->i_pages, index);
  	struct folio *folio;
-@@ -2384,8 +2387,14 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2384,8 +2391,14 @@ static void filemap_get_read_batch(struct address_space *mapping,
  			break;
  		if (xa_is_sibling(folio))
  			break;
@@ -479,7 +494,7 @@ index 0e20a8d6d..e238f0f69 100644
  
  		if (unlikely(folio != xas_reload(&xas)))
  			goto put_folio;
-@@ -2399,7 +2408,11 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2399,7 +2412,11 @@ static void filemap_get_read_batch(struct address_space *mapping,
  		xas_advance(&xas, folio->index + folio_nr_pages(folio) - 1);
  		continue;
  put_folio:
@@ -492,7 +507,40 @@ index 0e20a8d6d..e238f0f69 100644
  retry:
  		xas_reset(&xas);
  	}
-@@ -2570,6 +2583,11 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
+@@ -2470,7 +2487,6 @@ static int filemap_update_page(struct kiocb *iocb,
+ 		struct folio *folio)
+ {
+ 	int error;
+-
+ 	if (iocb->ki_flags & IOCB_NOWAIT) {
+ 		if (!filemap_invalidate_trylock_shared(mapping))
+ 			return -EAGAIN;
+@@ -2478,6 +2494,11 @@ static int filemap_update_page(struct kiocb *iocb,
+ 		filemap_invalidate_lock_shared(mapping);
+ 	}
+ 
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	pr_info("-\nfilemap_update_page 1-\n");
++	pr_info("folio->refcount = %d\n", atomic_read(&folio->_refcount));
++}
++
+ 	if (!folio_trylock(folio)) {
+ 		error = -EAGAIN;
+ 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_NOIO))
+@@ -2489,6 +2510,12 @@ static int filemap_update_page(struct kiocb *iocb,
+ 			 * previously submitted readahead to finish.
+ 			 */
+ 			folio_put_wait_locked(folio, TASK_KILLABLE);
++			
++			if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++				pr_info("-filemap_update_page 2-\n");
++				pr_info("folio->refcount = %d\n", atomic_read(&folio->_refcount));
++			}
++
+ 			return AOP_TRUNCATED_PAGE;
+ 		}
+ 		error = __folio_lock_async(folio, iocb->ki_waitq);
+@@ -2570,6 +2597,11 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
  		pgoff_t last_index)
  {
  	DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, folio->index);
@@ -504,7 +552,7 @@ index 0e20a8d6d..e238f0f69 100644
  
  	if (iocb->ki_flags & IOCB_NOIO)
  		return -EAGAIN;
-@@ -2580,6 +2598,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
+@@ -2580,6 +2612,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
  static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  		struct folio_batch *fbatch)
  {
@@ -512,7 +560,7 @@ index 0e20a8d6d..e238f0f69 100644
  	struct file *filp = iocb->ki_filp;
  	struct address_space *mapping = filp->f_mapping;
  	struct file_ra_state *ra = &filp->f_ra;
-@@ -2587,21 +2606,39 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2587,21 +2620,39 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  	pgoff_t last_index;
  	struct folio *folio;
  	int err = 0;
@@ -554,7 +602,7 @@ index 0e20a8d6d..e238f0f69 100644
  	if (!folio_batch_count(fbatch)) {
  		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
  			return -EAGAIN;
-@@ -2611,10 +2648,12 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2611,28 +2662,71 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
  			goto retry;
  		return err;
  	}
@@ -562,18 +610,27 @@ index 0e20a8d6d..e238f0f69 100644
  	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
  	if (folio_test_readahead(folio)) {
  		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
-+		if(paygo)
-+			pr_info("filemap_readahead err = %d\n", err);		
++		if(iocb->ki_filp->f_mapping->host->i_ino == 524337)
++			pr_info("\nfilemap_readahead err = %d\n\n", err);		
 +
  		if (err)
  			goto err;
  	}
-@@ -2623,16 +2662,48 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch->folios[0]->_refcount);
++	pr_info("-3-\n");
++	pr_info("fbatch->nr = %d\n", fbatch->nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
+ 	if (!folio_test_uptodate(folio)) {
+ 		if ((iocb->ki_flags & IOCB_WAITQ) &&
  		    folio_batch_count(fbatch) > 1)
  			iocb->ki_flags |= IOCB_NOWAIT;
  		err = filemap_update_page(iocb, mapping, iter, folio);
-+		if(paygo)
-+			pr_info("filemap_update_page err = %d\n", err);		
++
++		if(iocb->ki_filp->f_mapping->host->i_ino == 524337)
++			pr_info("\nfilemap_update_page err = %d\n\n", err);		
 +
  		if (err)
  			goto err;
@@ -582,7 +639,7 @@ index 0e20a8d6d..e238f0f69 100644
 +if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
 +	int ref;
 +	ref = atomic_read(&fbatch->folios[0]->_refcount);
-+	pr_info("-3-\n");
++	pr_info("-4-\n");
 +	pr_info("fbatch->nr = %d\n", fbatch->nr);
 +	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
 +}
@@ -599,10 +656,11 @@ index 0e20a8d6d..e238f0f69 100644
 +	pr_info("fbatch->nr = %d\n", fbatch->nr);
 +	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
 +}
-+	if(paygo)
-+		my_folio_put(folio);
 +	if (err < 0) {
-+		if(!paygo) {
++		if(paygo) {
++			my_folio_put(folio);
++		}
++		else {
 +			folio_put(folio);
 +		}
 +	}	
@@ -620,7 +678,7 @@ index 0e20a8d6d..e238f0f69 100644
  	if (err == AOP_TRUNCATED_PAGE)
  		goto retry;
  	return err;
-@@ -2661,6 +2732,7 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
+@@ -2661,6 +2755,7 @@ static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
  ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  		ssize_t already_read)
  {
@@ -628,7 +686,7 @@ index 0e20a8d6d..e238f0f69 100644
  	struct file *filp = iocb->ki_filp;
  	struct file_ra_state *ra = &filp->f_ra;
  	struct address_space *mapping = filp->f_mapping;
-@@ -2669,7 +2741,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2669,7 +2764,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  	int i, error = 0;
  	bool writably_mapped;
  	loff_t isize, end_offset;
@@ -637,7 +695,7 @@ index 0e20a8d6d..e238f0f69 100644
  	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
  		return 0;
  	if (unlikely(!iov_iter_count(iter)))
-@@ -2691,8 +2763,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2691,8 +2786,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  
  		if (unlikely(iocb->ki_pos >= i_size_read(inode)))
  			break;
@@ -649,9 +707,43 @@ index 0e20a8d6d..e238f0f69 100644
  		if (error < 0)
  			break;
  
-@@ -2755,8 +2829,13 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2719,10 +2816,25 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+ 		 * When a read accesses the same folio several times, only
+ 		 * mark it as accessed the first time.
+ 		 */
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch.folios[0]->_refcount);
++	pr_info("-5-\n");
++	pr_info("fbatch->nr = %d\n", fbatch.nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
+ 		if (!pos_same_folio(iocb->ki_pos, ra->prev_pos - 1,
+ 							fbatch.folios[0]))
+ 			folio_mark_accessed(fbatch.folios[0]);
+ 
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch.folios[0]->_refcount);
++	pr_info("-6-\n");
++	pr_info("fbatch->nr = %d\n", fbatch.nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
++
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+ 			struct folio *folio = fbatch.folios[i];
+ 			size_t fsize = folio_size(folio);
+@@ -2754,9 +2866,28 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+ 				break;
  			}
  		}
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch.folios[0]->_refcount);
++	pr_info("-7-\n");
++	pr_info("fbatch->nr = %d\n", fbatch.nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
  put_folios:
 -		for (i = 0; i < folio_batch_count(&fbatch); i++)
 -			folio_put(fbatch.folios[i]);
@@ -662,9 +754,30 @@ index 0e20a8d6d..e238f0f69 100644
 +				folio_put(fbatch.folios[i]);
 +			}
 +		}
++if(iocb->ki_filp->f_mapping->host->i_ino == 524337) {
++	int ref;
++	ref = atomic_read(&fbatch.folios[0]->_refcount);
++	pr_info("-8 after put-\n");
++	pr_info("fbatch->nr = %d\n", fbatch.nr);
++	pr_info("fbatch->folioes[0]->_refcount = %d\n", ref);
++}
  		folio_batch_init(&fbatch);
  	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
  
+@@ -3507,11 +3638,13 @@ EXPORT_SYMBOL(generic_file_readonly_mmap);
+ static struct folio *do_read_cache_folio(struct address_space *mapping,
+ 		pgoff_t index, filler_t filler, struct file *file, gfp_t gfp)
+ {
++	int paygo;
+ 	struct folio *folio;
+ 	int err;
+ 
+ 	if (!filler)
+ 		filler = mapping->a_ops->read_folio;
++	paygo = file->paygo;
+ repeat:
+ 	folio = filemap_get_folio(mapping, index);
+ 	if (!folio) {
 diff --git a/mm/myref.c b/mm/myref.c
 new file mode 100644
 index 000000000..3f8c774a3
@@ -1161,3 +1274,80 @@ index 000000000..8b937b1a6
 +	}
 +}
 +EXPORT_SYMBOL(traverse_paygo);
+diff --git a/mm/swap.c b/mm/swap.c
+index 70e2063ef..f7f920559 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -487,6 +487,7 @@ static void folio_inc_refs(struct folio *folio)
+  */
+ void folio_mark_accessed(struct folio *folio)
+ {
++
+ 	if (lru_gen_enabled()) {
+ 		folio_inc_refs(folio);
+ 		return;
+diff --git a/mm/truncate.c b/mm/truncate.c
+index 7b4ea4c4a..99b8c2092 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -498,6 +498,7 @@ EXPORT_SYMBOL(truncate_inode_pages_final);
+ unsigned long invalidate_mapping_pagevec(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec)
+ {
++	int paygo;
+ 	pgoff_t indices[PAGEVEC_SIZE];
+ 	struct folio_batch fbatch;
+ 	pgoff_t index = start;
+@@ -505,6 +506,11 @@ unsigned long invalidate_mapping_pagevec(struct address_space *mapping,
+ 	unsigned long count = 0;
+ 	int i;
+ 
++	paygo = atomic_read(&mapping->host->paygo); 
++	if(paygo) {
++		pr_info("paygo in invalidate_mapping_pagevec = %d\n", paygo);
++	}
++
+ 	folio_batch_init(&fbatch);
+ 	while (find_lock_entries(mapping, &index, end, &fbatch, indices)) {
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 5b7b8d4f5..8e138f612 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -12,6 +12,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/myref.h>
+ #include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/module.h>
+@@ -1327,6 +1328,7 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
+ 			    bool reclaimed, struct mem_cgroup *target_memcg)
+ {
+ 	int refcount;
++	int paygo;
+ 	void *shadow = NULL;
+ 
+ 	BUG_ON(!folio_test_locked(folio));
+@@ -1360,9 +1362,18 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
+ 	 * Note that if the dirty flag is always set via folio_mark_dirty,
+ 	 * and thus under the i_pages lock, then this ordering is not required.
+ 	 */
++	paygo = atomic_read(&mapping->host->paygo);
+ 	refcount = 1 + folio_nr_pages(folio);
+-	if (!folio_ref_freeze(folio, refcount))
+-		goto cannot_free;
++//	if (!folio_ref_freeze(folio, refcount))
++//		goto cannot_free;
++	if(paygo) {
++		if(!my_folio_can_freeze(folio, refcount))
++			goto cannot_free;
++		pr_info("can free the folio %p!\n", (void*)folio);
++	} else {
++		if(!folio_ref_freeze(folio, refcount))
++			goto cannot_free;
++	}
+ 	/* note: atomic_cmpxchg in folio_ref_freeze provides the smp_rmb */
+ 	if (unlikely(folio_test_dirty(folio))) {
+ 		folio_ref_unfreeze(folio, refcount);
