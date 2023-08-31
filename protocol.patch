@@ -41,7 +41,7 @@ index edc110d90..dd05ceb5a 100644
  		goto put_module;
  	if (mode & FMODE_EXCL) {
 diff --git a/block/partitions/core.c b/block/partitions/core.c
-index b8112f52d..983b88e4b 100644
+index b8112f52d..35d42f7f4 100644
 --- a/block/partitions/core.c
 +++ b/block/partitions/core.c
 @@ -140,9 +140,13 @@ static struct parsed_partitions *check_partition(struct gendisk *hd)
@@ -126,8 +126,11 @@ index b8112f52d..983b88e4b 100644
  		if (ret == -EAGAIN)
  			goto rescan;
  	} else if (invalidate) {
-@@ -717,7 +742,7 @@ void *read_part_sector(struct parsed_partitions *state, sector_t n, Sector *p)
+@@ -715,9 +740,10 @@ void *read_part_sector(struct parsed_partitions *state, sector_t n, Sector *p)
+ 	}
+ 
  	folio = read_mapping_folio(mapping, n >> PAGE_SECTORS_SHIFT, NULL);
++	pr_info("[3]folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&(folio->_refcount)));
  	if (IS_ERR(folio))
  		goto out;
 -
@@ -136,7 +139,7 @@ index b8112f52d..983b88e4b 100644
  	return folio_address(folio) + offset_in_folio(folio, n * SECTOR_SIZE);
  out:
 diff --git a/block/partitions/efi.c b/block/partitions/efi.c
-index 5e9be13a5..54706dd1f 100644
+index 5e9be13a5..817c6145c 100644
 --- a/block/partitions/efi.c
 +++ b/block/partitions/efi.c
 @@ -87,6 +87,7 @@
@@ -147,46 +150,84 @@ index 5e9be13a5..54706dd1f 100644
  #include "check.h"
  #include "efi.h"
  
-@@ -251,7 +252,8 @@ static size_t read_lba(struct parsed_partitions *state,
+@@ -241,7 +242,6 @@ static size_t read_lba(struct parsed_partitions *state,
+ 
+ 	if (!buffer || lba > last_lba(state->disk))
+                 return 0;
+-
+ 	while (count) {
+ 		int copied = 512;
+ 		Sector sect;
+@@ -251,7 +251,9 @@ static size_t read_lba(struct parsed_partitions *state,
  		if (copied > count)
  			copied = count;
  		memcpy(buffer, data, copied);
 -		put_dev_sector(sect);
++		pr_info("[4]folio = %p\t refcount = %d\n", (void*)sect.v, atomic_read(&((sect.v)->_refcount)));
 +		//put_dev_sector(sect);
 +		my_folio_put(sect.v);
  		buffer += copied;
  		totalreadcount +=copied;
  		count -= copied;
-@@ -340,9 +342,15 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
+@@ -285,12 +287,16 @@ static gpt_entry *alloc_read_gpt_entries(struct parsed_partitions *state,
+ 	if (!pte)
+ 		return NULL;
+ 
++	pr_info("alloc1	ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("alloc1 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
+ 	if (read_lba(state, le64_to_cpu(gpt->partition_entry_lba),
+ 			(u8 *) pte, count) < count) {
+ 		kfree(pte);
+                 pte=NULL;
+ 		return NULL;
+ 	}
++	pr_info("alloc2	ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("alloc2 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
+ 	return pte;
+ }
+ 
+@@ -340,9 +346,15 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
  
  	if (!ptes)
  		return 0;
-+	pr_info("rjs0 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
-+	pr_info("rjs0 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++	pr_info("is_gpt_valid0 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("is_gpt_valid0 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
 +
  	if (!(*gpt = alloc_read_gpt_header(state, lba)))
  		return 0;
  
-+	pr_info("rjs1 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
-+	pr_info("rjs1 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++	pr_info("is_gpt_valid1 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("is_gpt_valid1 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
 +
  	/* Check the GUID Partition Table signature */
  	if (le64_to_cpu((*gpt)->signature) != GPT_HEADER_SIGNATURE) {
  		pr_debug("GUID Partition Table Header signature is wrong:"
-@@ -427,8 +435,12 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
+@@ -427,8 +439,12 @@ static int is_gpt_valid(struct parsed_partitions *state, u64 lba,
  		goto fail;
  	}
  
-+	pr_info("rjs3 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
-+	pr_info("rjs3 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++	pr_info("rjs2 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("rjs2 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
  	if (!(*ptes = alloc_read_gpt_entries(state, *gpt)))
  		goto fail;
-+	pr_info("rjs4 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
-+	pr_info("rjs4 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++	pr_info("rjs3 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("rjs3 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
  
  	/* Check the GUID Partition Entry Array CRC */
  	crc = efi_crc32((const unsigned char *) (*ptes), pt_size);
-@@ -612,6 +624,9 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
+@@ -593,7 +609,11 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
+ 	if (!ptes)
+ 		return 0;
+ 
++	pr_info("qkr0 ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("qkr0 nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++
+ 	lastlba = last_lba(state->disk);
++
+         if (!force_gpt) {
+ 		/* This will be added to the EFI Spec. per Intel after v1.02. */
+ 		legacymbr = kzalloc(sizeof(*legacymbr), GFP_KERNEL);
+@@ -612,6 +632,9 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
  						"protective" : "hybrid");
  	}
  
@@ -196,7 +237,7 @@ index 5e9be13a5..54706dd1f 100644
  	good_pgpt = is_gpt_valid(state, GPT_PRIMARY_PARTITION_TABLE_LBA,
  				 &pgpt, &pptes);
          if (good_pgpt)
-@@ -621,6 +636,9 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
+@@ -621,6 +644,9 @@ static int find_valid_gpt(struct parsed_partitions *state, gpt_header **gpt,
          if (!good_agpt && force_gpt)
                  good_agpt = is_gpt_valid(state, lastlba, &agpt, &aptes);
  
@@ -206,14 +247,38 @@ index 5e9be13a5..54706dd1f 100644
  	if (!good_agpt && force_gpt && fops->alternative_gpt_sector) {
  		sector_t agpt_sector;
  		int err;
-@@ -716,6 +734,7 @@ int efi_partition(struct parsed_partitions *state)
- 	gpt_entry *ptes = NULL;
+@@ -717,11 +743,17 @@ int efi_partition(struct parsed_partitions *state)
  	u32 i;
  	unsigned ssz = queue_logical_block_size(state->disk->queue) / 512;
-+	pr_info("efi_partition!!!\n");
  
++	pr_info("efi start  ino = %lu\n", state->disk->part0->bd_inode->i_ino);
++	pr_info("efi start  nrpages = %lu\n", state->disk->part0->bd_inode->i_mapping->nrpages);
++
++	pr_info("\nefi_partition 1!!!\n\n");
++
  	if (!find_valid_gpt(state, &gpt, &ptes) || !gpt || !ptes) {
  		kfree(gpt);
+ 		kfree(ptes);
+ 		return 0;
+ 	}
++	pr_info("\nefi_partition 2!!!\n\n");
+ 
+ 	pr_debug("GUID Partition Table is valid!  Yea!\n");
+ 
+diff --git a/fs/buffer.c b/fs/buffer.c
+index d9c6d1fbb..ab27f294d 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -2248,7 +2248,9 @@ int block_read_full_folio(struct folio *folio, get_block_t *get_block)
+ 
+ 	VM_BUG_ON_FOLIO(folio_test_large(folio), folio);
+ 
++	pr_info("\tfiller1 folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 	head = create_page_buffers(&folio->page, inode, 0);
++	pr_info("\tfiller2 folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 	blocksize = head->b_size;
+ 	bbits = block_size_bits(blocksize);
+ 
 diff --git a/include/linux/myref.h b/include/linux/myref.h
 new file mode 100644
 index 000000000..b58467d64
@@ -364,7 +429,7 @@ index 8e105e5b3..132145282 100644
  
  ifdef CONFIG_MMU
 diff --git a/mm/filemap.c b/mm/filemap.c
-index 0e20a8d6d..3157262c4 100644
+index 0e20a8d6d..0bc28bd5c 100644
 --- a/mm/filemap.c
 +++ b/mm/filemap.c
 @@ -10,6 +10,8 @@
@@ -376,7 +441,7 @@ index 0e20a8d6d..3157262c4 100644
  #include <linux/export.h>
  #include <linux/compiler.h>
  #include <linux/dax.h>
-@@ -225,6 +227,7 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
+@@ -225,16 +227,21 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
  
  void filemap_free_folio(struct address_space *mapping, struct folio *folio)
  {
@@ -384,8 +449,12 @@ index 0e20a8d6d..3157262c4 100644
  	void (*free_folio)(struct folio *);
  	int refs = 1;
  
-@@ -234,7 +237,10 @@ void filemap_free_folio(struct address_space *mapping, struct folio *folio)
- 
+ 	free_folio = mapping->a_ops->free_folio;
+ 	if (free_folio)
+ 		free_folio(folio);
+-
++	traverse_paygo();
++	pr_info("filemap_free_folio\tfolio = %p\tfolio->_refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
  	if (folio_test_large(folio) && !folio_test_hugetlb(folio))
  		refs = folio_nr_pages(folio);
 -	folio_put_refs(folio, refs);
@@ -396,19 +465,19 @@ index 0e20a8d6d..3157262c4 100644
  }
  
  /**
-@@ -337,6 +343,11 @@ void delete_from_page_cache_batch(struct address_space *mapping,
+@@ -337,6 +344,11 @@ void delete_from_page_cache_batch(struct address_space *mapping,
  		inode_add_lru(mapping->host);
  	spin_unlock(&mapping->host->i_lock);
  
 +	pr_info("fbatch->nr = %d\n", folio_batch_count(fbatch));
 +	for (i = 0; i < folio_batch_count(fbatch); i++) {
-+		pr_info("folio->_refcount = %d\n", atomic_read(&fbatch->folios[i]->_refcount));
++		pr_info("folio = %p\tfolio->_refcount = %d\n", (void*)fbatch->folios[i], atomic_read(&fbatch->folios[i]->_refcount));
 +	}
 +
  	for (i = 0; i < folio_batch_count(fbatch); i++)
  		filemap_free_folio(mapping, fbatch->folios[i]);
  }
-@@ -812,6 +823,7 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
+@@ -812,6 +824,7 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
  	VM_BUG_ON_FOLIO(new->mapping, new);
  
  	folio_get(new);
@@ -416,7 +485,7 @@ index 0e20a8d6d..3157262c4 100644
  	new->mapping = mapping;
  	new->index = offset;
  
-@@ -834,12 +846,14 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
+@@ -834,12 +847,14 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
  	if (free_folio)
  		free_folio(old);
  	folio_put(old);
@@ -431,7 +500,7 @@ index 0e20a8d6d..3157262c4 100644
  	XA_STATE(xas, &mapping->i_pages, index);
  	int huge = folio_test_hugetlb(folio);
  	bool charged = false;
-@@ -860,7 +874,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
+@@ -860,7 +875,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
  	}
  
  	gfp &= GFP_RECLAIM_MASK;
@@ -443,7 +512,7 @@ index 0e20a8d6d..3157262c4 100644
  	folio->mapping = mapping;
  	folio->index = xas.xa_index;
  
-@@ -920,7 +937,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
+@@ -920,7 +938,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
  		mem_cgroup_uncharge(folio);
  	folio->mapping = NULL;
  	/* Leave page->index set: truncation relies upon it */
@@ -455,7 +524,7 @@ index 0e20a8d6d..3157262c4 100644
  	return xas_error(&xas);
  }
  ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
-@@ -1039,6 +1059,7 @@ void __init pagecache_init(void)
+@@ -1039,6 +1060,7 @@ void __init pagecache_init(void)
  		init_waitqueue_head(&folio_wait_table[i]);
  
  	page_writeback_init();
@@ -463,7 +532,7 @@ index 0e20a8d6d..3157262c4 100644
  }
  
  /*
-@@ -1275,7 +1296,8 @@ static inline int folio_wait_bit_common(struct folio *folio, int bit_nr,
+@@ -1275,7 +1297,8 @@ static inline int folio_wait_bit_common(struct folio *folio, int bit_nr,
  	 * We can drop our reference to the folio.
  	 */
  	if (behavior == DROP)
@@ -473,7 +542,7 @@ index 0e20a8d6d..3157262c4 100644
  
  	/*
  	 * Note that until the "finish_wait()", or until
-@@ -1545,6 +1567,7 @@ void folio_end_private_2(struct folio *folio)
+@@ -1545,6 +1568,7 @@ void folio_end_private_2(struct folio *folio)
  	clear_bit_unlock(PG_private_2, folio_flags(folio, 0));
  	folio_wake_bit(folio, PG_private_2);
  	folio_put(folio);
@@ -481,7 +550,7 @@ index 0e20a8d6d..3157262c4 100644
  }
  EXPORT_SYMBOL(folio_end_private_2);
  
-@@ -1611,6 +1634,7 @@ void folio_end_writeback(struct folio *folio)
+@@ -1611,6 +1635,7 @@ void folio_end_writeback(struct folio *folio)
  	 * reused before the folio_wake().
  	 */
  	folio_get(folio);
@@ -489,7 +558,7 @@ index 0e20a8d6d..3157262c4 100644
  	if (!__folio_end_writeback(folio))
  		BUG();
  
-@@ -1618,6 +1642,7 @@ void folio_end_writeback(struct folio *folio)
+@@ -1618,6 +1643,7 @@ void folio_end_writeback(struct folio *folio)
  	folio_wake(folio, PG_writeback);
  	acct_reclaim_writeback(folio);
  	folio_put(folio);
@@ -497,7 +566,7 @@ index 0e20a8d6d..3157262c4 100644
  }
  EXPORT_SYMBOL(folio_end_writeback);
  
-@@ -1861,11 +1886,13 @@ static void *mapping_get_entry(struct address_space *mapping, pgoff_t index)
+@@ -1861,11 +1887,13 @@ static void *mapping_get_entry(struct address_space *mapping, pgoff_t index)
  	if (!folio || xa_is_value(folio))
  		goto out;
  
@@ -513,7 +582,7 @@ index 0e20a8d6d..3157262c4 100644
  		goto repeat;
  	}
  out:
-@@ -1925,7 +1952,8 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
+@@ -1925,7 +1953,8 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
  	if (fgp_flags & FGP_LOCK) {
  		if (fgp_flags & FGP_NOWAIT) {
  			if (!folio_trylock(folio)) {
@@ -523,7 +592,7 @@ index 0e20a8d6d..3157262c4 100644
  				return NULL;
  			}
  		} else {
-@@ -1935,7 +1963,8 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
+@@ -1935,7 +1964,8 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
  		/* Has the page been truncated? */
  		if (unlikely(folio->mapping != mapping)) {
  			folio_unlock(folio);
@@ -533,7 +602,7 @@ index 0e20a8d6d..3157262c4 100644
  			goto repeat;
  		}
  		VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
-@@ -1976,6 +2005,7 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
+@@ -1976,6 +2006,7 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
  
  		err = filemap_add_folio(mapping, folio, index, gfp);
  		if (unlikely(err)) {
@@ -541,7 +610,7 @@ index 0e20a8d6d..3157262c4 100644
  			folio_put(folio);
  			folio = NULL;
  			if (err == -EEXIST)
-@@ -2016,10 +2046,12 @@ static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
+@@ -2016,10 +2047,12 @@ static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
  		return folio;
  
  	if (!folio_try_get_rcu(folio))
@@ -554,7 +623,7 @@ index 0e20a8d6d..3157262c4 100644
  		goto reset;
  	}
  
-@@ -2124,6 +2156,7 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
+@@ -2124,6 +2157,7 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
  		folio_unlock(folio);
  put:
  		folio_put(folio);
@@ -562,7 +631,7 @@ index 0e20a8d6d..3157262c4 100644
  	}
  	rcu_read_unlock();
  
-@@ -2244,6 +2277,7 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
+@@ -2244,6 +2278,7 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
  			goto update_start;
  
  		if (!folio_try_get_rcu(folio))
@@ -570,7 +639,7 @@ index 0e20a8d6d..3157262c4 100644
  			goto retry;
  
  		if (unlikely(folio != xas_reload(&xas)))
-@@ -2260,6 +2294,7 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
+@@ -2260,6 +2295,7 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
  		continue;
  put_folio:
  		folio_put(folio);
@@ -578,7 +647,7 @@ index 0e20a8d6d..3157262c4 100644
  
  retry:
  		xas_reset(&xas);
-@@ -2384,8 +2419,9 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2384,8 +2420,9 @@ static void filemap_get_read_batch(struct address_space *mapping,
  			break;
  		if (xa_is_sibling(folio))
  			break;
@@ -590,7 +659,7 @@ index 0e20a8d6d..3157262c4 100644
  
  		if (unlikely(folio != xas_reload(&xas)))
  			goto put_folio;
-@@ -2399,7 +2435,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
+@@ -2399,7 +2436,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
  		xas_advance(&xas, folio->index + folio_nr_pages(folio) - 1);
  		continue;
  put_folio:
@@ -600,7 +669,17 @@ index 0e20a8d6d..3157262c4 100644
  retry:
  		xas_reset(&xas);
  	}
-@@ -2756,7 +2793,8 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+@@ -2423,7 +2461,9 @@ static int filemap_read_folio(struct file *file, filler_t filler,
+ 	/* Start the actual read. The read will unlock the page. */
+ 	if (unlikely(workingset))
+ 		psi_memstall_enter(&pflags);
++	pr_info("filemap_read_folio1\t folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 	error = filler(file, folio);
++	pr_info("filemap_read_folio2\t folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 	if (unlikely(workingset))
+ 		psi_memstall_leave(&pflags);
+ 	if (error)
+@@ -2756,7 +2796,8 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  		}
  put_folios:
  		for (i = 0; i < folio_batch_count(&fbatch); i++)
@@ -610,7 +689,7 @@ index 0e20a8d6d..3157262c4 100644
  		folio_batch_init(&fbatch);
  	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
  
-@@ -2934,6 +2972,7 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+@@ -2934,6 +2975,7 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
  			xas_set(&xas, pos >> PAGE_SHIFT);
  		if (!xa_is_value(folio))
  			folio_put(folio);
@@ -618,7 +697,7 @@ index 0e20a8d6d..3157262c4 100644
  	}
  	if (seek_data)
  		start = -ENXIO;
-@@ -2941,6 +2980,7 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+@@ -2941,6 +2983,7 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
  	rcu_read_unlock();
  	if (folio && !xa_is_value(folio))
  		folio_put(folio);
@@ -626,7 +705,7 @@ index 0e20a8d6d..3157262c4 100644
  	if (start > end)
  		return end;
  	return start;
-@@ -3180,6 +3220,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+@@ -3180,6 +3223,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
  	if (unlikely(folio->mapping != mapping)) {
  		folio_unlock(folio);
  		folio_put(folio);
@@ -634,7 +713,7 @@ index 0e20a8d6d..3157262c4 100644
  		goto retry_find;
  	}
  	VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
-@@ -3198,6 +3239,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+@@ -3198,6 +3242,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
  		if (!mapping_locked) {
  			folio_unlock(folio);
  			folio_put(folio);
@@ -642,7 +721,7 @@ index 0e20a8d6d..3157262c4 100644
  			goto retry_find;
  		}
  		goto page_not_uptodate;
-@@ -3223,6 +3265,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+@@ -3223,6 +3268,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
  	if (unlikely(index >= max_idx)) {
  		folio_unlock(folio);
  		folio_put(folio);
@@ -650,7 +729,7 @@ index 0e20a8d6d..3157262c4 100644
  		return VM_FAULT_SIGBUS;
  	}
  
-@@ -3241,6 +3284,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+@@ -3241,6 +3287,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
  	if (fpin)
  		goto out_retry;
  	folio_put(folio);
@@ -658,7 +737,7 @@ index 0e20a8d6d..3157262c4 100644
  
  	if (!error || error == AOP_TRUNCATED_PAGE)
  		goto retry_find;
-@@ -3256,6 +3300,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+@@ -3256,6 +3303,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
  	 */
  	if (folio)
  		folio_put(folio);
@@ -666,7 +745,7 @@ index 0e20a8d6d..3157262c4 100644
  	if (mapping_locked)
  		filemap_invalidate_unlock_shared(mapping);
  	if (fpin)
-@@ -3313,7 +3358,9 @@ static struct folio *next_uptodate_page(struct folio *folio,
+@@ -3313,7 +3361,9 @@ static struct folio *next_uptodate_page(struct folio *folio,
  		if (folio_test_locked(folio))
  			continue;
  		if (!folio_try_get_rcu(folio))
@@ -676,7 +755,7 @@ index 0e20a8d6d..3157262c4 100644
  		/* Has the page moved or been split? */
  		if (unlikely(folio != xas_reload(xas)))
  			goto skip;
-@@ -3333,6 +3380,7 @@ static struct folio *next_uptodate_page(struct folio *folio,
+@@ -3333,6 +3383,7 @@ static struct folio *next_uptodate_page(struct folio *folio,
  		folio_unlock(folio);
  skip:
  		folio_put(folio);
@@ -684,7 +763,7 @@ index 0e20a8d6d..3157262c4 100644
  	} while ((folio = xas_next_entry(xas, end_pgoff)) != NULL);
  
  	return NULL;
-@@ -3422,6 +3470,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
+@@ -3422,6 +3473,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
  		}
  		folio_unlock(folio);
  		folio_put(folio);
@@ -692,16 +771,38 @@ index 0e20a8d6d..3157262c4 100644
  	} while ((folio = next_map_page(mapping, &xas, end_pgoff)) != NULL);
  	pte_unmap_unlock(vmf->pte, vmf->ptl);
  out:
-@@ -3520,6 +3569,8 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
+@@ -3514,12 +3566,22 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
+ 		filler = mapping->a_ops->read_folio;
+ repeat:
+ 	folio = filemap_get_folio(mapping, index);
++	if(folio)
++		pr_info("[1]folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
++	else 
++		pr_info("[1]folio = %p\t", (void*)folio);
++			
+ 	if (!folio) {
+ 		folio = filemap_alloc_folio(gfp, 0);
++		pr_info("\t[NULL 1]folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 		if (!folio)
  			return ERR_PTR(-ENOMEM);
  		err = filemap_add_folio(mapping, folio, index, gfp);
++		pr_info("\t[NULL 2]folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
++		pr_info("\t\terr = %d\n", err);
  		if (unlikely(err)) {
 +			// this folio_put => make reference count 1->0 to free the err page.
 +			// so do not use my_folio_put
  			folio_put(folio);
  			if (err == -EEXIST)
  				goto repeat;
-@@ -3540,7 +3591,8 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
+@@ -3529,6 +3591,7 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
+ 
+ 		goto filler;
+ 	}
++	pr_info("[2]folio = %p\t refcount = %d\n", (void*)folio, atomic_read(&folio->_refcount));
+ 	if (folio_test_uptodate(folio))
+ 		goto out;
+ 
+@@ -3540,7 +3603,8 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
  	/* Folio was truncated from mapping */
  	if (!folio->mapping) {
  		folio_unlock(folio);
@@ -711,7 +812,7 @@ index 0e20a8d6d..3157262c4 100644
  		goto repeat;
  	}
  
-@@ -3554,6 +3606,7 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
+@@ -3554,6 +3618,7 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
  	err = filemap_read_folio(file, filler, folio);
  	if (err) {
  		folio_put(folio);
